@@ -32,6 +32,60 @@ from .config import APP_DIR, MODELS_DIR
 
 BIN_DIR = APP_DIR / "bin"
 
+# 断句用的 VAD 模型。只有 629 KB，但少了它整个程序不能用：
+# 它负责判断「你什么时候开口、什么时候说完」，缺了就连录音都起不来。
+VAD_FILE = MODELS_DIR / "silero_vad.onnx"
+
+
+def backup_dir() -> Path:
+    """VAD 模型的备份目录。
+
+    特意放在 `data/` 而不是 `models/` 旁边：杀毒软件误杀时往往按目录/文件名
+    一起清，跟原件放一起备份等于没备份。`data/` 里是用户数据（热词、语料），
+    杀软基本不碰。
+    """
+    return APP_DIR / "data" / "backup"
+
+
+def backup_vad() -> bool:
+    """把 VAD 模型备份一份。原件不在或备份已是最新时什么都不做。
+
+    返回是否真的写了一次备份。
+    """
+    if not VAD_FILE.exists():
+        return False
+    dst = backup_dir() / VAD_FILE.name
+    try:
+        if dst.exists() and dst.stat().st_size == VAD_FILE.stat().st_size:
+            return False
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(VAD_FILE, dst)
+        return True
+    except Exception:
+        return False
+
+
+def ensure_vad() -> str:
+    """确认 VAD 模型在位；不在就尝试从备份恢复。
+
+    返回：
+      "ok"        本来就在
+      "restored"  刚从一个备份恢复回来（说明它之前被删了）
+      "missing"   没有备份，恢复不了，只能重新下载
+    """
+    if VAD_FILE.exists():
+        backup_vad()               # 顺手把备份补上/更新
+        return "ok"
+    dst = backup_dir() / VAD_FILE.name
+    if not dst.exists():
+        return "missing"
+    try:
+        VAD_FILE.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(dst, VAD_FILE)
+        return "restored" if VAD_FILE.exists() else "missing"
+    except Exception:
+        return "missing"
+
 
 def rime_dir() -> Path:
     """拼音组件放哪 —— 必须和 rime_setup._bundle_root() 的判断顺序一致。
@@ -457,6 +511,11 @@ def fetch(items: list[dict], want: set[str] | None = None,
             except Exception as e:
                 failed.append(label)
                 log(f"  解压失败：{e}")
+
+    # 下完就备份一份断句模型。它只有 629 KB，却是「程序能不能启动」的关键，
+    # 而用户机器上的杀毒软件偶尔会把它当可疑文件隔离 —— 有备份就能自己长回来。
+    if backup_vad():
+        log("已备份断句模型（万一被误删可自动恢复）")
     return failed
 
 

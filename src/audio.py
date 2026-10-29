@@ -29,6 +29,41 @@ def build_vad(model_path: str, sample_rate: int, cfg: dict):
     return sherpa_onnx.VoiceActivityDetector(vad_cfg, buffer_size_in_seconds=60)
 
 
+def _edge_silence(x: np.ndarray, sample_rate: int,
+                  frame_sec: float = 0.02) -> tuple[int, int]:
+    """量一段音频首尾各有多少静音，返回 (头, 尾) 的采样数。
+
+    口径与 _trim_silence 完全一致（20ms 帧、阈值 max(0.004, 峰值×0.08)），
+    这样「哪算有声」的判断全局只有一套。
+
+    为什么需要它：silero 判一句说完，靠的是「已经静了 silence_ms(500ms)」，
+    这 500ms 静音**被算进了段里**。实测（2026-10-30，ar1 截 3 秒）段的
+    有声区间只有 0.18~3.02 秒，段本身是 0.14~3.66 —— 尾部挂着 0.64 秒
+    静音 padding。
+
+    如果直接拿段边界算「上一段到这一段的间隔」，0.64 秒就被吃掉了：
+    素材里真实 2.0 秒的停顿，按段边界只有 1.35 秒，跨过 _GAP_STOP(1.6)
+    的判据就翻不过来 —— 该断句号的地方断成逗号。扣掉两端 padding 之后
+    是 1.99 秒，跟真值对得上。
+    """
+    if len(x) == 0:
+        return 0, 0
+    frame = max(1, int(sample_rate * frame_sec))
+    n = len(x) // frame
+    if n < 2:
+        return 0, 0
+    rms = np.sqrt(np.mean(x[:n * frame].reshape(n, frame) ** 2, axis=1))
+    peak = float(rms.max())
+    if peak < 0.004:
+        return len(x), 0                      # 整段都是底噪
+    idx = np.nonzero(rms > max(0.004, peak * 0.08))[0]
+    if len(idx) == 0:
+        return len(x), 0
+    lead = int(idx[0] * frame)
+    tail = int(n * frame - (idx[-1] + 1) * frame)
+    return max(0, lead), max(0, tail)
+
+
 def _trim_silence(x: np.ndarray, sample_rate: int,
                   frame_sec: float = 0.02, keep_sec: float = 0.20) -> np.ndarray:
     """削掉首尾的静音。
@@ -119,6 +154,7 @@ class Recorder:
             float(vad_cfg.get("max_latency_s", 7)) * sample_rate)
         self._acc: list[np.ndarray] = []
         self._voiced = 0
+        self._acc_base = 0      # _acc 第一块在整条流里的绝对起点（_reset_acc 维护）
 
         # 短段合并：不到 min_asr_sec 的段先攒着，跟下一段拼起来再送识别。
         # 识别模型是整段解码的，看不到别的上下文，片段越短同音字越容易错。
@@ -127,8 +163,29 @@ class Recorder:
         self.max_segment_samples = int(
             float(vad_cfg.get("max_segment_s", 20)) * sample_rate)
         self.min_tail_samples = int(self.MIN_TAIL_SEC * sample_rate)
+        # 碰到这么长的停顿时，攒着的段先单独送出去，不再往后合并。
+        # 0.70 秒与 main._GAP_COMMA 是同一个值（那里按它断逗号），两边必须
+        # 同步：这里不断开，那处停顿就到不了 _join_segments，判据等于白设。
+        #
+        # 代价（实测已知）：断开意味着前一段可能短于 min_asr_sec(3 秒)、要
+        # 单独送识别，而短段没有上下文、同音字更容易错。这是「断句准」和
+        # 「识别准」之间的取舍 —— 用户 2026-10-30 明确要断句准。
+        self._split_gap_samples = int(0.70 * sample_rate)
         self._pending: list[tuple[np.ndarray, int]] = []   # (音频, 距离上一段的静音采样数)
-        self._last_end = 0      # 上一段在 VAD 输入流里的结束位置（采样点）
+        # 上一段语音在这个**绝对坐标系**里的结束位置（采样点）。
+        # 绝对坐标 = _vad_base + seg.start，原因见下面 _fed 的注释。
+        self._last_end = 0
+        # VAD 的坐标基准。seg.start 是「自上次 vad.reset() 以来」的位置，
+        # **不是**整条流的绝对位置：实测 reset 之后立刻从 2816 这种小值重新
+        # 开始（同一段素材不 reset 时是 34816 附近，加回 32000 的基准正好吻合）。
+        # 而 _callback 每 3 秒有声就强切一次并 reset —— 所以录音过程中拿到的
+        # seg.start 必须先加基准才能和 _last_end 比。
+        #
+        # 不加基准的后果是实测过的（2026-10-30，真实 Recorder 驱动 1.0s / 2.5s
+        # 停顿的素材）：两处停顿全被算成 0.00s，于是 _join_segments 一律
+        # 「直接接上」，再靠字数兜底加逗号 —— 就是用户说的「一逗到底」。
+        self._fed = 0           # 本轮累计喂给 VAD 的采样数（含按键前预缓冲）
+        self._vad_base = 0      # VAD 的 0 点对应的绝对位置
 
         # 整轮录音的**全程音频**：麦克风收到的每一块都进来，不等 VAD 判断。
         # 松键后拿它整段重解一次。
@@ -163,8 +220,12 @@ class Recorder:
         keep_voiced 用于「VAD 切出一段」的情形：音频已经被 VAD 拿走了，
         必须清 _acc 免得重复，但**有声时长不能清** —— 清了的话，用户每
         停顿一次强制切分的计时就归零，一口气说很久也永远不触发。
+
+        顺手记下新缓冲在整条流里的起点（_acc_base）：算硬切段的「前置停顿」
+        时必须知道这段音频从哪儿开始，不能只看它自己的头部静音。
         """
         self._acc = []
+        self._acc_base = self._fed
         if not keep_voiced:
             self._voiced = 0
 
@@ -182,7 +243,15 @@ class Recorder:
 
         forced=True 表示这段是硬切出来的（不是自然句尾），调用方据此
         知道「后面还有下文」，不会在中间加句号。
+
+        **碰到句号级停顿就先断开，不并进去。** 合并会把中间的停顿一起吞掉：
+        实测（2026-10-30）1.08 秒那段带着 0.08 秒间隔、2.46 秒那段带着
+        2.50 秒间隔，并成一段之后只剩第一段的 0.08 秒 —— 那处明显的换气
+        就被吃掉了，文本里该断句号的地方只能落到逗号。断开之后每段各带
+        各的 gap 走，_join_segments 才拿得到真实间隔。
         """
+        if self._pending and gap >= self._split_gap_samples:
+            self._emit_pending()            # 先送走前面攒的，中间断开
         self._pending.append((np.asarray(samples, dtype=np.float32), gap))
         total = sum(len(p[0]) for p in self._pending)
 
@@ -190,20 +259,37 @@ class Recorder:
             return False                    # 太短，先攒着等下一段
         if total >= self.max_segment_samples:
             forced = True                   # 攒过头了，先送出去
+        return self._emit_pending(forced=forced)
 
-        # 合并时 gap 取第一段的：它才是这段相对上一段的真实间隔，
-        # 后面几段的间隔属于段内部，已经被并进同一段音频里了
+    def _emit_pending(self, forced: bool = False,
+                      min_samples: int | None = None,
+                      trim: bool = True) -> bool:
+        """把攒着的段合并成一次识别送出去。
+
+        合并时 gap 取第一段的：它才是这段相对上一段的真实间隔，后面几段的
+        间隔属于段内部，已经被并进同一段音频里了 —— 也正因为如此，_push
+        才会在句号级停顿处先断开，免得把停顿并没了。
+
+        trim=False 时原样送出（松键收尾那条路用，它最怕削掉尾音）。
+        """
+        if not self._pending:
+            return False
         raw = (self._pending[0][0] if len(self._pending) == 1
                else np.concatenate([p[0] for p in self._pending]))
         first_gap = self._pending[0][1]
         self._pending = []
-        # 削掉首尾静音再送「分段识别」。硬切片段常带着几秒静音，不削的话
-        # 模型会拿它当引子往下编（日志里表现为把热词表念出来）
-        #
-        # 但整段缓冲收的是**削之前**的原始音频：重解要的是真实录音，
-        # 削首尾会把句尾那 300ms 静音一起剪掉，末字就没了（见 _all_buf 注释）。
-        buf = _trim_silence(raw, self.sample_rate)
-        if len(buf) < int(0.20 * self.sample_rate):
+        if trim:
+            # 削掉首尾静音再送「分段识别」。硬切片段常带着几秒静音，不削的话
+            # 模型会拿它当引子往下编（日志里表现为把热词表念出来）
+            #
+            # 但整段缓冲收的是**削之前**的原始音频：重解要的是真实录音，
+            # 削首尾会把句尾那 300ms 静音一起剪掉，末字就没了（见 _all_buf 注释）。
+            buf = _trim_silence(raw, self.sample_rate)
+        else:
+            buf = raw
+        floor = (int(0.20 * self.sample_rate) if min_samples is None
+                 else min_samples)
+        if len(buf) < floor:
             return False                # 削完不剩什么，说明这段基本是静音
         # 先攒进整轮缓冲，再入队：入队后取数线程可能立刻解完并通知收尾，
         # 那时候再补就漏了最后一段。
@@ -257,16 +343,14 @@ class Recorder:
         「一句话末尾丢字」—— 0.3 秒中文能说一到两个字，用户说完最后一个字
         立刻松键，那半句就被当成「不值得识别的零头」扔掉了。
         _pending 里攒的都是 VAD 判过有声音的片段，不是静音，再短也该送。
+
+        这里**不削首尾静音**（trim=False）：松键这一口气最怕削掉尾音，而
+        攒着的段本就已经是 VAD 判过有声的。削静音是给硬切段用的，两回事。
         """
-        if not self._pending:
-            return
-        buf = (self._pending[0][0] if len(self._pending) == 1
-               else np.concatenate([p[0] for p in self._pending]))
-        first_gap = self._pending[0][1]
-        self._pending = []
         # 只挡真正的碎片：不到 60ms 的音发不出完整的字，送进去只会出乱码
-        if len(buf) >= self.min_tail_samples // 5:
-            self._segments.put((buf, False, first_gap))
+        self._emit_pending(forced=False,
+                           min_samples=self.min_tail_samples // 5,
+                           trim=False)
 
     def _callback(self, indata, frames, time_info, status):
         samples = np.asarray(indata[:, 0], dtype=np.float32)
@@ -289,22 +373,30 @@ class Recorder:
             # 被丢的字在草稿和重解里都会消失（线上实测丢过「占」）。
             # 收全程才能让重解拿到真实录音。
             self._append_all(samples)
+            # 先记账再喂：喂完 VAD 就可能吐出段来，那时要用到当前绝对位置
+            self._fed += len(samples)
             try:
                 self.vad.accept_waveform(samples)
                 # 路径 1：VAD 判定的句子结尾
                 while not self.vad.empty():
                     seg = self.vad.front
-                    # seg.start 是这一段在输入流里的绝对采样位置（C API 明确
-                    # 保证 lifetime 内单调递增）。减去上一段的结束位置，就是
-                    # 这两段之间真实的静音长度 —— 断句最硬的依据。
                     seg_start = int(getattr(seg, "start", -1))
+                    smp = np.array(seg.samples, dtype=np.float32)
                     gap = -1
                     if seg_start >= 0:
+                        # seg.start 是「自上次 reset 以来」的位置，加基准才是整条
+                        # 流的绝对位置（reset 会归零，见 __init__ 里 _fed 注释）。
+                        #
+                        # 而且段边界不是语音边界：段里挂着 VAD 判句用的 500ms
+                        # 静音 padding（实测段尾 0.64s）。不扣掉的话，真实 2.0s
+                        # 的停顿只量出 1.35s，跨不过 _GAP_STOP(1.6) —— 该断句号
+                        # 的地方会断成逗号，正是「一逗到底」。
+                        lead, tail = _edge_silence(smp, self.sample_rate)
+                        abs_start = self._vad_base + seg_start + lead
                         if self._last_end > 0:
-                            gap = max(0, seg_start - self._last_end)
-                        self._last_end = seg_start + len(seg.samples)
-                    sent = self._push(
-                        np.array(seg.samples, dtype=np.float32).copy(), gap=gap)
+                            gap = max(0, abs_start - self._last_end)
+                        self._last_end = self._vad_base + seg_start + len(smp) - tail
+                    sent = self._push(smp, gap=gap)
                     self.vad.pop()
                     # 音频已被 VAD 取走，_acc 必须清（不清硬切时会重复）。
                     # _voiced 只在真的送出去识别后才清零：段被攒着时清掉的话，
@@ -316,11 +408,29 @@ class Recorder:
                 if float(np.sqrt(np.mean(samples ** 2))) > self.SILENCE_RMS:
                     self._voiced += len(samples)
                 if self._voiced >= self.max_latency_samples and self._acc:
-                    # gap=0：强制切分意味着中间没有停顿，下一段要直接接上
-                    self._push(np.concatenate(self._acc), forced=True, gap=0)
+                    # 硬切以前一律记 gap=0（"中间没停顿，直接接上"）。但 _acc 是
+                    # 「自上次被 VAD 取走以来的所有块」，里面**含中间那些静音**：
+                    # 实测（2026-10-30）一次硬切段 2.98 秒，头部挂着 1.90 秒静音
+                    # —— 那是上一句说完后真正停顿的两秒，被记成 0 就白丢了。
+                    #
+                    # 而且不能只拿「这段自己的头部静音」当 gap：VAD 判一句说完
+                    # 要等 silence_ms(500ms)，那半秒音频进的是 VAD、不是 _acc，
+                    # 两头都不算就少了半秒（实测把 1.0 秒停顿量成 0.40 秒）。
+                    # 所以要用「这段在整条流里的起点」减「上一段语音的终点」
+                    # （_acc_base 在 _reset_acc 里记下的就是这个起点）。
+                    buf = np.concatenate(self._acc)
+                    lead, tail = _edge_silence(buf, self.sample_rate)
+                    acc_start = self._acc_base + lead
+                    if self._last_end > 0:
+                        gap = max(0, acc_start - self._last_end)
+                    else:
+                        gap = lead
+                    self._push(buf, forced=True, gap=gap)
+                    self._last_end = self._acc_base + len(buf) - tail
                     self._reset_acc()
                     # VAD 内部还攒着同一段，不 reset 会重复出一遍
                     self.vad.reset()
+                    self._vad_base = self._fed      # reset 后 VAD 从 0 重新计数
                 elif len(self._acc) > self.max_latency_samples * 3 // 512 + 60:
                     # 一直在静音，攒着的没必要留
                     self._reset_acc()
@@ -408,6 +518,14 @@ class Recorder:
                 self._stop_timer.cancel()
                 self._stop_timer = None
             self._closing = False
+            # 坐标基准先归零，再清累积缓冲 —— _reset_acc 会把 _acc_base 记成
+            # 当前的 _fed，顺序反了就会把上一轮的计数带进来。
+            # （不能指望上一轮一定走完了 _finish_stop，异常中断时走不到。）
+            self._fed = 0
+            self._vad_base = 0
+            # 新一轮从零开始算静音间隔。中途 vad.reset() 不清，那之后是
+            # 「一口气继续往下说」，本来就该按无停顿处理
+            self._last_end = 0
             self._reset_acc()
             self._pending = []
             # 新一轮：清掉上一轮留下的全程音频，否则重解会把两段话拼在一起
@@ -415,9 +533,6 @@ class Recorder:
                 self._all_buf = []
                 self._all_len = 0
                 self._all_truncated = False
-            # 新一轮从零开始算静音间隔。中途 vad.reset() 不清，那之后是
-            # 「一口气继续往下说」，本来就该按无停顿处理
-            self._last_end = 0
             # 把按键前的预缓冲倒进 VAD：这 400ms 就是以前丢掉的开头
             pre = list(self._preroll)
             self._preroll.clear()
@@ -430,6 +545,7 @@ class Recorder:
                 try:
                     for blk in pre:
                         self._append_all(blk)
+                        self._fed += len(blk)      # 预缓冲也是 VAD 的输入
                         self.vad.accept_waveform(blk)
                 except Exception:
                     pass

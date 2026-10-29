@@ -571,6 +571,14 @@ class App:
         """缺识别模型就弹引导。只在真缺的时候弹，不打扰老用户。"""
         try:
             from src import fetch as F
+            # 断句模型可能被单独删掉（杀毒软件），先试着从备份恢复。
+            # 恢复成功就不该再弹下载引导 —— 那不是用户需要处理的事。
+            state = F.ensure_vad()
+            if state == "restored":
+                log.warning("启动时发现断句模型缺失，已从备份恢复")
+                self.hud.flash("done", "断句模型被删了，已自动恢复", 3500)
+            elif state == "missing":
+                log.error("断句模型缺失且没有备份，需要重新下载")
             missing = F.check(["vad", "asr"])
         except Exception as e:
             log.warning("检查模型失败：%s", e)
@@ -755,9 +763,26 @@ class App:
         self._start()
 
     def _make_recorder(self):
+        # 断句模型可能被杀毒软件隔离掉（只有 629 KB，行为又像「加载二进制」）。
+        # 先试着自己从备份长回来，长不回来才报错 —— 让用户对着「缺少 VAD 模型:
+        # D:\...\silero_vad.onnx」这种一行英文路径干瞪眼，等于没说。
+        try:
+            from src import fetch as F
+            state = F.ensure_vad()
+        except Exception as e:
+            log.warning("检查断句模型失败：%s", e)
+            state = "ok"
+        if state == "restored":
+            log.warning("断句模型之前不见了，已从备份恢复（多半被杀毒软件隔离过）")
+            self.bridge.hint.emit("断句模型被删了，已自动恢复")
+        elif state == "missing":
+            log.error("断句模型缺失且没有备份：%s", MODELS_DIR / "silero_vad.onnx")
+            self.bridge.error.emit(
+                "断句模型文件不见了，没找到备份。打开设置→检查组件，重新下载即可")
+            return
         vad_model = MODELS_DIR / "silero_vad.onnx"
         if not vad_model.exists():
-            self.bridge.error.emit(f"缺少 VAD 模型: {vad_model}")
+            self.bridge.error.emit("缺少 VAD 模型: %s" % vad_model)
             return
         sr = int(CONFIG.get("audio", "sample_rate"))
         dev = CONFIG.get("audio", "device")
@@ -1488,7 +1513,7 @@ def main():
     app = App(qt)
     # 启动标记：每次部署完先看这一行，确认跑的是哪一版、哪个行为开关生效。
     # 没有这行就只能靠猜（曾经把「应该已经生效」当成结论报给用户）。
-    log.info("启动标记 BUILD=2026-10-30-r14 版本=%s 整段重解上限=%.0fs "
+    log.info("启动标记 BUILD=2026-10-30-r15 版本=%s 整段重解上限=%.0fs "
              "分块上限=%.0fs×%d 粘贴模式=%s 整理级别=%s 自动替换=%s",
              APP_VERSION,
              _MAX_REDECODE_SEC, _CHUNK_SEC, _MAX_CHUNKS,
