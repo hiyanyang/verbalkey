@@ -1,5 +1,7 @@
 # Verbalkey
 
+<img src="docs/screenshots/hud.png" width="620" alt="按住右 Alt 说话，浮窗里实时滚出识别结果，松开就写进光标">
+
 **Windows 上的本地语音输入。按住热键说话，浮窗里看着字出来，松开就写进光标。**
 
 识别、断句、去口水词、整理成书面语，全部在这台机器上算完。录音不落盘、不上传，拔了网线照样能用。
@@ -126,6 +128,10 @@
 不需要安装 Python，不需要管理员权限（只有装拼音引擎那一步会弹一次授权框）。
 **全程点两次**：一次是这个「开始下载并安装」，一次是装拼音时的系统授权框。
 
+<img src="docs/screenshots/first-run.png" width="520" alt="第一次启动弹出的窗口：列出要下载的三项和体积（942 MB / 964 MB / 29 MB），勾选后点「开始下载并安装」">
+
+第一项「语音识别」是必需的，默认勾上且不能取消，所以那个框是灰的——不是坏了。
+
 #### 三条红线（踩了会报错）
 
 | 别这么做 | 会怎样 | 正确做法 |
@@ -188,6 +194,8 @@ python -m venv .venv
 确认键默认右 Ctrl，和录音键分开，不会打架。
 
 ## 设置项说明
+
+<img src="docs/screenshots/settings.png" width="780" alt="设置窗口：左侧是分页导航，右侧按功能分组，开关和下拉直接改，即时生效">
 
 **通用** — 开机自启、浮窗位置、浮窗字号（小 16 / 标准 18 / 大 20）、上屏方式（自动 / 仅 Ctrl+V / 仅发消息）。
 
@@ -461,6 +469,7 @@ verbalkey/
 ├── bin/llama/         llama-server.exe（下载，不入库）
 ├── assets/            图标（入库）；rime/ 是拼音组件（不入库）
 ├── tools/             fetch_models.py 下载命令、build.py 打包、release.py 发版
+├── docs/screenshots/  README 里的三张界面截图
 ├── entry.py           打包入口（带崩溃日志）
 ├── verbalkey.spec     PyInstaller 配置
 ├── install.bat / run.bat / start.vbs
