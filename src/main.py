@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.asr import AsrEngine  # noqa: E402
-from src.audio import Recorder  # noqa: E402
+from src.audio import Recorder, _trim_silence  # noqa: E402
 from src.config import (  # noqa: E402
     APP_NAME, APP_VERSION, CONFIG, LOGS_DIR, MODELS_DIR, VK_CONFIRM_NAME, VK_NAME,
 )
@@ -678,7 +678,17 @@ class App:
         失败、超长、或用户已经在说下一段，一律退回草稿 —— 绝不让它比现在更差。
         """
         sr = int(CONFIG.get("audio", "sample_rate"))
-        secs = len(utterance) / max(sr, 1)
+        # 整轮缓冲存的是原始音频（未削静音），里面含按键前 0.8 秒预缓冲和段间
+        # 所有停顿。两头削一次：太长的静音引子会让模型顺着热词 prompt 往下编
+        # （实测有一段前面拖了 6.5 秒静音）。只削两头，中间的停顿是真停顿。
+        # 尾部补齐不在这里做 —— 那是解码层的事（asr._TAIL_PAD_SEC），
+        # 放这儿会被削掉。
+        clean = _trim_silence(utterance, sr)
+        if len(clean) < len(utterance):
+            log.info("整段重解前削掉首尾静音 %.2fs → %.2fs",
+                     len(utterance) / sr, len(clean) / sr)
+        # 上限按削过之后的长度算：说话的净长度才是模型要吃的量
+        secs = len(clean) / max(sr, 1)
         if secs > _MAX_REDECODE_SEC:
             log.info("跳过整段重解：音频 %.1fs 超过 %.0fs 上限（再长会被模型截断）",
                      secs, _MAX_REDECODE_SEC)
@@ -686,9 +696,11 @@ class App:
         if self.busy:
             log.info("跳过整段重解：已经在录下一段")
             return draft
+        if not len(clean):
+            return draft              # 整段都是底噪，没什么可解的
         t0 = time.time()
         try:
-            text = self.asr.transcribe(utterance, sr)
+            text = self.asr.transcribe(clean, sr)
         except Exception as e:
             log.warning("整段重解失败，沿用分段结果：%s", e)
             return draft
@@ -723,7 +735,16 @@ class App:
             # 没开整理：把整段重解的结果交回去替换草稿。
             # 一律发出去，改不改由 _apply_redecode 判断 —— 发空串会让浮窗
             # 挂着 15 秒的兜底定时器干等（谁都不来收）。
-            self.bridge.polished.emit(base, "", seq)
+            #
+            # level=1（去口水词）必须在这里再清一遍：草稿的清理在 _on_finish
+            # 里，而 polished 模式下草稿只走浮窗、没上屏，终稿才是用户留下的
+            # 文字。只清草稿等于这档从没生效过。
+            # 只认 level==1：level=0 是「开着整理但选了不整理」，清它就是越权。
+            # dedup=False：终稿里「对对对」「哈哈哈」是真语气，别压成单字。
+            # 顺序要求：必须在上面 record() 之后 —— 语料存的是模型原文，
+            # 清过了再记，学纠正的对照表就被规则污染了。
+            out = rule_polish(base, level, dedup=False) if level == 1 else base
+            self.bridge.polished.emit(out, "", seq)
             return
         t0 = time.time()
         out, err = self.polish.polish(base, level)

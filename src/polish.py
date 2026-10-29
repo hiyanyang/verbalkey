@@ -136,10 +136,17 @@ _THINK = re.compile(r"<think>.*?</think>", re.S)
 # 位置无关的填充词：这些删掉永远不会改变意思
 # 「对不对」不在列表里：它多数时候是真实提问（「这样对不对」），删了就成了陈述句
 _GLUE_FILLERS = [r"那个那个", r"这个这个", r"就是说", r"然后的话"]
-# 语气词：单字，任意位置都能删
+# 语气词：句中能删，**句尾不删**。「你说这样行不行啊？」「好的哦。」里的
+# 啊/哦 是语气不是口水，删掉问句的语气就没了。实测 33 条真实语料，被旧规则
+# 误删的 3 个字全是句尾「啊」（什么字体啊 / 先别执行啊 / 什么内容啊）。
+# 另外它顺手修了个老 bug：整句只有语气词时（「啊？」）以前会变成孤零零的「？」。
 _TONE_FILLERS = [r"嗯+", r"啊+", r"哦+", r"呃+", r"唉+", r"呣+"]
 _GLUE_RE = re.compile("|".join(_GLUE_FILLERS))
-_TONE_RE = re.compile("|".join(_TONE_FILLERS))
+# 两条 lookahead 决定删不删：
+#   (?![。！？!?…~～]|$)  后面紧跟句末标点或已到结尾 → 是语气，留着
+#   (?!同字)              一长串同字的结尾不能只删掉一半（「嗯嗯。」不该变「嗯。」）
+_TONE_RE = re.compile("|".join(
+    f + f"(?!{f[0]})(?![。！？!?…~～]|$)" for f in _TONE_FILLERS))
 
 
 def _drop_lead_fillers(s: str) -> str:
@@ -157,20 +164,25 @@ def _drop_lead_fillers(s: str) -> str:
     return out
 
 
-def rule_polish(text: str, level: int) -> str:
+def rule_polish(text: str, level: int, dedup: bool = True) -> str:
     """规则整理。保守：只删高置信度的填充词，不改措辞。
 
     这里不做「相邻两字词重复」的压缩（ABAB → AB）：中文里「考虑考虑」
     「商量商量」是正常说法，压掉就成了病句。结巴的重复基本是单字三连，
     用 (.)\\1{2,} 就够。
+
+    dedup=False 跳过那条单字三连压缩。终稿要用这个值：草稿是「边说边出」的
+    临时品，压掉结巴没损失；终稿是要落到用户文档里的最终文本，「对对对」
+    「哈哈哈」在那里面是真实语气，压成「对」「哈」是改意思，不是清理。
     """
     if not text:
         return text
     out = _GLUE_RE.sub("", text)
     out = _TONE_RE.sub("", out)
     out = _drop_lead_fillers(out)
-    # 单字重复三次以上：我我我 → 我
-    out = re.sub(r"(.)\1{2,}", r"\1", out)
+    # 单字重复三次以上：我我我 → 我（终稿路径传 dedup=False 跳过）
+    if dedup:
+        out = re.sub(r"(.)\1{2,}", r"\1", out)
     # 中文之间不该有空格，ASR 有时会插
     out = re.sub(r"(?<=[\u4e00-\u9fa5，。！？、；：])[ \t]+(?=[\u4e00-\u9fa5])", "", out)
     out = re.sub(r"\s{2,}", " ", out).strip()

@@ -128,10 +128,15 @@ class Recorder:
         self._pending: list[tuple[np.ndarray, int]] = []   # (音频, 距离上一段的静音采样数)
         self._last_end = 0      # 上一段在 VAD 输入流里的结束位置（采样点）
 
-        # 整轮录音的全部音频（每段已削过首尾静音）。松键后拿它整段重解一次。
+        # 整轮录音的全部音频，**未削静音**。松键后拿它整段重解一次。
         # VAD 分段 → 每段独立解码，上下文在边界处断掉，跨边界的词两半各解一次
         # 就会丢字（线上日志实测：「长句子断句吧，个断句还是…」丢了「这」）。
         # 整段重解上下文完整，是这条链路的正解，代价是多 1~2 秒。
+        #
+        # 存原始音频而不是削过的，是因为 _trim_silence 只留 200ms 首尾：
+        # 实测同一段音频「尾部静音 200ms → 末字丢；补到 500ms → 末字回来」
+        # （树杈 → 树）。削过再拼接等于把重解的输入先破坏一次，边界上的字
+        # 永远救不回来，日志里「分段 81 字 → 整段 80 字」就是这么来的。
         self._utterance: list[np.ndarray] = []
         self._utt_lock = threading.Lock()
 
@@ -175,22 +180,27 @@ class Recorder:
 
         # 合并时 gap 取第一段的：它才是这段相对上一段的真实间隔，
         # 后面几段的间隔属于段内部，已经被并进同一段音频里了
-        buf = (self._pending[0][0] if len(self._pending) == 1
+        raw = (self._pending[0][0] if len(self._pending) == 1
                else np.concatenate([p[0] for p in self._pending]))
         first_gap = self._pending[0][1]
         self._pending = []
-        # 削掉首尾静音再送。硬切片段常带着几秒静音，不削的话模型会拿它
-        # 当引子往下编（日志里表现为把热词表念出来）
-        buf = _trim_silence(buf, self.sample_rate)
+        # 削掉首尾静音再送「分段识别」。硬切片段常带着几秒静音，不削的话
+        # 模型会拿它当引子往下编（日志里表现为把热词表念出来）
+        #
+        # 但整段缓冲收的是**削之前**的原始音频：重解要的是真实录音，
+        # 削首尾会把句尾那 300ms 静音一起剪掉，末字就没了（见 _utterance 注释）。
+        buf = _trim_silence(raw, self.sample_rate)
         if len(buf) < int(0.20 * self.sample_rate):
             return False                # 削完不剩什么，说明这段基本是静音
         # 先攒进整轮缓冲，再入队：入队后取数线程可能立刻解完并通知收尾，
-        # 那时候再补就漏了最后一段
-        self._append_utterance(buf)
+        # 那时候再补就漏了最后一段。
+        # 传 raw 不传 buf —— raw 是这个 _push 收到的全部原始样本。
+        self._append_utterance(raw)
         self._segments.put((buf, forced, first_gap))
         return True
 
     def _append_utterance(self, buf: np.ndarray) -> None:
+        """攒整轮原始音频。分段缓冲和它共用同一份，别在这里做任何加工。"""
         if buf.size == 0:
             return
         with self._utt_lock:

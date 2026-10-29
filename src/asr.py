@@ -17,6 +17,25 @@ log = logging.getLogger(__name__)
 # 真实日志里是 8 个、9 个连着出现，正常口述不会这么排。
 _ECHO_MIN_RUN = 4
 
+# 解码前在音频尾部补这么长静音（秒）。
+#
+# 为什么需要：VAD 自然断句和「每 3 秒硬切」给出的段，实测段尾静音都是 0ms ——
+# 结束点正好停在最后一个有声帧上，最后一个字的尾音（鼻音/塞音收尾）本来就在
+# 帧边界之外。模型拿不到它就只能按语言先验猜，猜错就是「最后一个字丢了」。
+# sherpa-onnx 的 Whisper 接口有个 tail_paddings 参数，官方文档原话是中文要
+# 调到 300 帧才不截断句尾；Qwen3 接口没有这个参数，只能在音频层补。
+#
+# 补多少是实测扫出来的（4 段中文音频，同一套模型 + VAD，用 CER 里的删除数
+# 看丢字、CER 看整体错误率）：
+#   不补    CER 17.6%  删16
+#   0.2s    CER 15.0%  删 9
+#   0.4s    CER 14.2%  删10
+#   0.6s    CER 12.4%  删 9     ← 最优
+#   0.8s    CER 16.1%  删 6     ← 开始反噬（长静音又把模型带偏）
+#   1.0s    CER 17.5%  删 4
+# 所以不要再往上调；要改必须重跑 tools/probe_tail9.py 对比。
+_TAIL_PAD_SEC = 0.60
+
 
 def _hot_token(tok: str, words: set[str]) -> bool:
     """这个片段算不算热词的一部分。
@@ -232,8 +251,15 @@ class AsrEngine:
         with self._lock:
             if self.recognizer is None:
                 return ""
+            x = np.asarray(samples, dtype=np.float32)
+            if x.size:
+                # 尾部补静音，见 _TAIL_PAD_SEC：不补的话最后一个字的尾音
+                # 正好落在音频边界外，模型只能按语言先验猜，猜错就是丢字
+                x = np.concatenate(
+                    [x, np.zeros(int(sample_rate * _TAIL_PAD_SEC),
+                                 dtype=np.float32)])
             stream = self.recognizer.create_stream()
-            stream.accept_waveform(sample_rate, np.asarray(samples, dtype=np.float32))
+            stream.accept_waveform(sample_rate, x)
             self.recognizer.decode_stream(stream)
             return (stream.result.text or "").strip()
 
