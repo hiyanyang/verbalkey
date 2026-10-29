@@ -349,15 +349,19 @@ class PolishEngine:
             # 有时把「考虑考虑」改成「考虑」。这种事交给规则更靠谱。
             return rule_polish(text, 1), ""
 
+        # 下面几处降级都走 rule_polish，一律 dedup=False：
+        # 它们的返回值是**要落到用户文档里的终稿**，而 (.)\1{2,} 那条三连压缩
+        # 会把「对对对」压成「对」、「哈哈哈」压成「哈」—— 那是在改意思，不是清理。
+        # 草稿路径（main._on_finish）才需要压结巴。
         ok, err = self.ensure()
         if not ok:
             # 本地模型不可用就退回规则整理，保证功能不断。
             # err 只报一句短话：界面会把它拼进提示行，带上细节会太长。
-            return rule_polish(text, level), "已用规则整理"
+            return rule_polish(text, level, dedup=False), "已用规则整理"
 
         out = self._request(text, level, timeout)
         if out is None:
-            return rule_polish(text, level), "已用规则整理"
+            return rule_polish(text, level, dedup=False), "已用规则整理"
 
         # 模型没干活（输出几乎等于原文）就重试一次，把温度再推高。
         # 把问句答成陈述、把「你们」改成「我」，也是同一类「这次没干对」，一起重试。
@@ -373,7 +377,7 @@ class PolishEngine:
         # 不报「已用规则整理」：这时输出就是原文去掉口水词，本来就是用户要的，
         # 弹一行提示反而像出了错。
         if _question_lost(text, out) or _pronoun_lost(text, out):
-            return rule_polish(text, level), ""
+            return rule_polish(text, level, dedup=False), ""
 
         return _tidy(out, text), ""
 
