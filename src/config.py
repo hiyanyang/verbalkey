@@ -9,18 +9,24 @@ from copy import deepcopy
 from pathlib import Path
 
 def _app_dir() -> Path:
-    """源码跑的时候是项目根目录；打包成 exe 后，向上找带 models 目录的那层，
-    这样 config / logs / models 仍然和以前在同一个地方，不会因为打包而搬家。"""
+    """程序根目录：源码跑是项目根，打包后就是 exe 所在目录。
+
+    **不要再向上级目录找 models**。原来的实现会往上找「带 models 的那层」，
+    本意是让 `dist/Verbalkey` 里的 exe 仍读写项目根，但这在绿色版上是灾难：
+    用户把包解压到任何带 models 子目录的位置（甚至只是解压到某个项目文件夹下），
+    程序就会跑去读写别人的目录。实测过一次：解压到项目里的测试目录，
+    它顺着父目录找到了项目模型，既不弹首次引导，还把日志写到了项目根。
+
+    打包产物的 models/junction 本来就在 exe 同级，所以直接取 exe 目录即可。
+    """
     if getattr(sys, "frozen", False):
-        start = Path(sys.executable).resolve().parent
-        for p in [start, *start.parents]:
-            if (p / "models").is_dir():
-                return p
-        return start
+        return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent.parent
 
 
 APP_NAME = "Verbalkey"
+# 发版号。发布包名、日志启动行、设置页显示都用它，改一处就够
+APP_VERSION = "0.1.0"
 APP_DIR = _app_dir()
 CONFIG_PATH = APP_DIR / "config.json"
 MODELS_DIR = APP_DIR / "models"

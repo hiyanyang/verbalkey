@@ -10,16 +10,18 @@ import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
+from PySide6.QtWidgets import (
+    QApplication, QDialog, QMenu, QSystemTrayIcon,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.asr import AsrEngine  # noqa: E402
 from src.audio import Recorder  # noqa: E402
 from src.config import (  # noqa: E402
-    APP_NAME, CONFIG, LOGS_DIR, MODELS_DIR, VK_CONFIRM_NAME, VK_NAME,
+    APP_NAME, APP_VERSION, CONFIG, LOGS_DIR, MODELS_DIR, VK_CONFIRM_NAME, VK_NAME,
 )
 from src.hotkey import HotKey  # noqa: E402
 from src import hotwords  # noqa: E402
@@ -195,6 +197,9 @@ class App:
         self._tray()
         self._make_recorder()        # 预热麦克风：常开流，按下零延迟
         self._load_asr_async()
+        # 没模型时直接把「下什么、多大」摆出来，别让用户去翻 README 找链接。
+        # 延后一拍再弹：先让托盘图标出来，用户知道程序已经启动了
+        QTimer.singleShot(900, self._first_run_if_needed)
         self._start_hotkeys()
         self.apply_polish_config()
 
@@ -215,12 +220,15 @@ class App:
         self.tray = QSystemTrayIcon(make_icon(), self.qt)
         self.tray.setToolTip(self._tip_text())
         menu = QMenu()
+        a_setup = QAction("下载模型与组件…", menu)
+        a_setup.triggered.connect(self.open_setup)
         a_settings = QAction("设置…", menu)
         a_settings.triggered.connect(self.open_settings)
         a_reload = QAction("重载识别模型", menu)
         a_reload.triggered.connect(self.reload_asr)
         a_quit = QAction("退出", menu)
         a_quit.triggered.connect(self.quit)
+        menu.addAction(a_setup)
         menu.addAction(a_settings)
         menu.addAction(a_reload)
         menu.addSeparator()
@@ -290,6 +298,44 @@ class App:
             self.tray.setToolTip(self._tip_text())
 
     # ---------- 模型 ----------
+
+    def _first_run_if_needed(self):
+        """缺识别模型就弹引导。只在真缺的时候弹，不打扰老用户。"""
+        try:
+            from src import fetch as F
+            missing = F.check(["vad", "asr"])
+        except Exception as e:
+            log.warning("检查模型失败：%s", e)
+            return
+        if not missing:
+            return
+        log.info("缺少识别模型 %d 项，弹出下载引导", len(missing))
+        self.open_setup()
+
+    def open_setup(self):
+        """首次引导 / 补装组件。装完自动重载识别模型。"""
+        try:
+            from src.ui.firstrun import FirstRunDialog
+        except Exception:
+            log.exception("引导窗口导入失败")
+            self.hud.flash("error", "下载引导打不开，看 logs/app.log", 4000)
+            return
+        try:
+            dlg = FirstRunDialog()
+        except Exception:
+            log.exception("引导窗口创建失败")
+            self.hud.flash("error", "下载引导打不开，看 logs/app.log", 4000)
+            return
+        log.info("下载引导已打开")
+        ok = dlg.exec() == QDialog.Accepted
+        if ok:
+            self.reload_asr()
+            try:
+                self.tray.showMessage(
+                    "组件已就绪", "识别模型加载中，几秒后就能按热键说话",
+                    QSystemTrayIcon.Information, 4000)
+            except Exception:
+                pass
 
     def _load_asr_async(self):
         # 连点「重载模型」会起好几个加载线程，每个都要吃 800MB 和几秒 CPU。
@@ -978,9 +1024,14 @@ def _self_heal_paths() -> None:
             except FileNotFoundError:
                 old = None
             want = f'"{exe}"'
-            if old and old != want:
+            # 只在「原路径已经不存在」时才改：那是用户真的挪了目录。
+            # 若原路径还在（比如又跑了一份绿色副本），改写等于让副本劫持开机自启。
+            # 2026-10-30 实测踩过：把发布包解压到 D://vktest 跑了一次，
+            # 自启项就被改成指向测试目录了。
+            old_path = Path(str(old or "").strip('"'))
+            if old and old != want and not old_path.exists():
                 winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ, want)
-                log.info("自启路径已修正：%s", want)
+                log.info("自启路径已修正（原路径已失效）：%s", want)
     except OSError as e:
         log.debug("检查自启路径失败（忽略）：%s", e)
 
@@ -998,9 +1049,13 @@ def _self_heal_paths() -> None:
         same = (cur and os.path.normcase(os.path.abspath(cur))
                 == os.path.normcase(os.path.abspath(str(exe))))
         if cur and not same:
-            from . import rime_setup as rs
-            ok, msg = rs.rebrand()
-            log.info("输入法图标路径已修正：%s（%s）", exe, msg)
+            if Path(cur).exists():
+                # 另一个副本还在用：别抢。否则便携版会改掉正式安装的图标路径
+                log.debug("输入法图标指向另一个有效副本，保持不动：%s", cur)
+            else:
+                from . import rime_setup as rs
+                ok, msg = rs.rebrand()
+                log.info("输入法图标路径已修正：%s（%s）", exe, msg)
     except OSError as e:
         log.debug("检查图标路径失败（忽略）：%s", e)
 
@@ -1035,8 +1090,9 @@ def main():
     app = App(qt)
     # 启动标记：每次部署完先看这一行，确认跑的是哪一版、哪个行为开关生效。
     # 没有这行就只能靠猜（曾经把「应该已经生效」当成结论报给用户）。
-    log.info("启动标记 BUILD=2026-10-29-r10 整段重解上限=%.0fs 粘贴模式=%s "
-             "整理级别=%s 自动替换=%s",
+    log.info("启动标记 BUILD=2026-10-30-r11 版本=%s 整段重解上限=%.0fs "
+             "粘贴模式=%s 整理级别=%s 自动替换=%s",
+             APP_VERSION,
              _MAX_REDECODE_SEC,
              CONFIG.get("polish", "paste_mode"),
              CONFIG.get("polish", "level"),

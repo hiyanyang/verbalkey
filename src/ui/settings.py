@@ -213,6 +213,10 @@ class SettingsWindow(QMainWindow):
     _ice_checked = Signal(str, str)
     _ice_progress = Signal(int)
     _ice_updated = Signal(bool, str)
+    # 拼音安装现在是「先下 29 MB 组件再装引擎」，全程几十秒，
+    # 必须放后台线程，否则界面直接冻住（用户会以为崩了）
+    _rime_log = Signal(str)
+    _rime_done = Signal(bool, str)
 
     def __init__(self, app):
         super().__init__()
@@ -221,6 +225,8 @@ class SettingsWindow(QMainWindow):
         self._ice_checked.connect(self._on_ice_checked)
         self._ice_progress.connect(self._on_ice_progress)
         self._ice_updated.connect(self._on_ice_updated)
+        self._rime_log.connect(self._on_rime_log)
+        self._rime_done.connect(self._on_rime_installed)
         self.setWindowTitle(f"{APP_NAME} · 设置")
         self.setWindowIcon(make_icon())
         self.resize(780, 620)
@@ -910,15 +916,43 @@ class SettingsWindow(QMainWindow):
             self.lbl_ice_state.setText(f"更新失败：{msg}")
 
     def _install_rime(self):
-        try:
-            from .. import rime_setup
-            ok, msg = rime_setup.setup_all()
-        except Exception as e:
-            ok, msg = False, f"出错了: {e}"
+        """一键安装：缺组件先下（约 29 MB），再装引擎（一次 UAC），最后铺词库。"""
+        if getattr(self, "_rime_busy", False):
+            return
+        self._rime_busy = True
+        self.btn_rime.setEnabled(False)
+        self.btn_rime.setText("准备中…")
+        self.lbl_rime.setText("正在检查并下载组件…")
+        self.lbl_ime_pending.setText("")
+
+        def log(msg: str):
+            self._rime_log.emit(msg)
+
+        def work():
+            ok, msg = False, ""
+            try:
+                from .. import rime_setup
+                ok, msg = rime_setup.setup_all(on_log=log)
+            except Exception as e:
+                ok, msg = False, f"出错了: {e}"
+            self._rime_done.emit(ok, msg)
+
+        threading.Thread(target=work, daemon=True, name="rime-install").start()
+
+    def _on_rime_log(self, msg: str):
+        self.lbl_rime.setText(msg)
+        self.btn_rime.setText("安装中…")
+
+    def _on_rime_installed(self, ok: bool, msg: str):
+        self._rime_busy = False
+        self.btn_rime.setEnabled(True)
+        self.btn_rime.setText("安装拼音输入法")
         self._refresh_rime_status()
         if ok:
+            self.lbl_rime.setText(msg)
             QMessageBox.information(self, "拼音输入法", msg)
         else:
+            self.lbl_rime.setText(msg)
             QMessageBox.warning(self, "拼音输入法", msg)
 
     # ---------- 识别模型 ----------

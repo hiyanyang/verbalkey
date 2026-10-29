@@ -17,10 +17,10 @@ for pkg in ("opencc", "sounddevice", "sherpa_onnx"):
     hiddenimports += h
 
 datas += [("assets/app.ico", "assets")]
-# Rime 拼音输入法：引擎安装包 + 雾凇拼音词库。
-# 引擎本身必须装进系统（TSF 要求），所以连安装包一起带着；
-# 词库是纯数据，由程序铺到 %APPDATA%\Rime，用户不用自己折腾 Rime。
-datas += [("assets/rime", "assets/rime")]
+# Rime 拼音只带「部署器」（librime 官方 rime_deployer.exe + rime.dll，BSD-3，
+# 4 MB）。引擎安装包和雾凇词库是 GPL-3.0 的第三方二进制，不再随包分发，
+# 首次点「安装拼音输入法」时由 src/fetch.py 从上游拉，用户只需点一次 UAC。
+datas += [("assets/rime/deployer", "assets/rime/deployer")]
 
 a = Analysis(
     ["entry.py"],

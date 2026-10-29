@@ -827,14 +827,69 @@ def start_service() -> bool:
         return False
 
 
-def setup_all() -> tuple[bool, str]:
-    """一键搞定：注册 → 铺词库 → 编译 → 启动服务。"""
+def _wait_engine(timeout: float = 240.0) -> bool:
+    """等静默安装真正完成。
+
+    `ShellExecuteW(runas, ... "/S")` 是**异步**的：返回 >32 只代表拉起来了，
+    安装进程还在后台跑。以前这里直接返回「装完后重新点一次」，用户就得点两次。
+    现在轮询安装目录，装好立刻接下一步。
+    """
+    import time
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if rime_install_dir() is not None:
+            return True
+        time.sleep(1.0)
+    return rime_install_dir() is not None
+
+
+def ensure_bundle(on_log=None, on_progress=None, stop=None) -> tuple[bool, str]:
+    """确保拼音引擎安装包和雾凇词库在位，缺了就现下（合计约 29 MB）。
+
+    为什么不随包分发：这两个是 GPL-3.0 的第三方二进制，体积也不小。
+    随包分发意味着要给每个下载者附带 GPL 源码义务，不如运行时从上游拉。
+    """
+    from . import fetch as F
+
+    items = F.select(["pinyin"])
+    todo = [a for a in items if F.status(a) != "ok"]
+    if not todo:
+        return True, "组件已就位"
+    if on_log:
+        on_log(f"下载拼音组件（{len(todo)} 项，约 "
+               f"{F.estimate_mb(todo):.0f} MB）")
+    failed = F.fetch(todo, on_log=on_log, on_progress=on_progress, stop=stop)
+    if failed:
+        return False, f"下载失败：{'、'.join(failed)}。检查网络后重试，已下的会留着"
+    return True, "组件已就位"
+
+
+def setup_all(on_log=None, on_progress=None, stop=None) -> tuple[bool, str]:
+    """一键搞定：补组件 → 装引擎 → 注册 → 铺词库 → 编译 → 换品牌。
+
+    用户全程只需要点一次 UAC 授权（装引擎那下），其余全自动。
+    """
+    def log(msg: str) -> None:
+        if on_log:
+            on_log(msg)
+
+    # 0) 引擎安装包 + 词库：缺就现下
+    ok, msg = ensure_bundle(on_log, on_progress, stop)
+    if not ok:
+        return False, msg
+
+    # 1) 引擎没装就装，并等它真的装完（别再让用户点第二次）
     if rime_install_dir() is None:
+        if stop and stop():
+            return False, "已取消"
+        log("安装拼音引擎，会弹一次系统授权框，点「是」")
         ok, msg = install_engine()
         if not ok:
             return False, msg
-        return True, "安装程序已启动，装完后重新点一次即可完成配置"
-
+        if not _wait_engine():
+            return False, "引擎没装完（授权框被关掉了？）。重试一次即可"
+        log("引擎装好了")
+        # 装完这个词库/配置还是空的，继续往下走
     # 注册进系统。安装器其实已经写好了，绝大部分情况下这里什么都不用做；
     # 只有安装器跑了但注册没写成功时，才把同一套结构补进 HKCU（不需要管理员）。
     try:
@@ -852,15 +907,17 @@ def setup_all() -> tuple[bool, str]:
     except Exception as e:
         return False, f"注册输入法失败: {e}"
 
+    log("铺词库到用户目录")
     ok, msg = deploy_ice()
     if not ok:
         return False, msg
+    log("编译词库（1–2 分钟，可以先用语音功能）")
     ok, msg = trigger_deploy()
     if not ok:
         return False, msg
     # 名字和图标换成 Verbalkey（内部会重启 WeaselServer 刷新缓存）
     rebrand()
-    return True, "已装好。按 Win+空格 切到 Verbalkey 就能打拼音"
+    return True, "拼音输入法已就绪。按 Win+空格 或 Shift 切到 Verbalkey 就能打拼音"
 
 
 if __name__ == "__main__":

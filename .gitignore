@@ -4,6 +4,9 @@
 /models/
 
 # ---- 构建产物（每次打包几十上百 MB，且含旧代码）----
+# release/ 是 tools/release.py 的产出：72 MB 的 zip + 182 MB 暂存目录。
+# 发版文件挂 GitHub Release，不能进代码历史（否则 clone 一次多 250 MB）
+/release/
 /build/
 /build2/
 /build_icon/
@@ -12,9 +15,13 @@
 /dist2/
 
 # ---- 第三方二进制：llama.cpp、小狼毫引擎与雾凇词库 ----
-# 体积大，且各自带自己的许可证，不适合塞进本仓库再分发
+# 体积大，且各自带自己的许可证，不适合塞进本仓库再分发。
+# 例外：deployer/ 只有 4 MB，是 librime 官方的命令行部署器（BSD-3-Clause，
+# 可自由再分发）。没有它就无法自动重编译词库 —— 小狼毫自带的
+# WeaselDeployer.exe 是 GUI 版，会挂在那儿等人点，脚本化会超时。
 /bin/
-/assets/rime/
+/assets/rime/*
+!/assets/rime/deployer/
 
 # ---- 本机数据 ----
 # config.json 里有本机绝对路径；data/ 是成对语料（含说过的原话）；

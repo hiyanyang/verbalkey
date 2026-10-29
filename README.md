@@ -40,10 +40,13 @@
 
 | 什么时候 | 连哪里 | 传什么 |
 |---|---|---|
-| 你手动点「设置 → 拼音输入法 → 词库更新」 | GitHub（iDvel/rime-ice） | 只下载词库，不上传 |
-| 你手动跑 `install.bat` / `tools/fetch_models.py` | ModelScope、GitHub | 只下载模型，不上传 |
+| 首次启动，你点「开始下载」之后 | ModelScope（模型）、GitHub（llama.cpp） | 只下载，不上传 |
+| 你点「设置 → 拼音输入法 → 安装拼音输入法」 | GitHub（小狼毫、雾凇词库） | 只下载，不上传 |
+| 你点「设置 → 拼音输入法 → 词库更新」 | GitHub（iDvel/rime-ice） | 只下载，不上传 |
 
-除此之外没有任何对外连接：不检查更新、不埋点、不发统计、没有账号体系、没有许可证校验。断网时功能不受影响（词库更新会失败，别的都在）。
+三处都是**你点了才动**：程序启动不会自己去连任何东西，也不会在后台悄悄补下载。
+除此之外没有任何对外连接——不检查更新、不埋点、不发统计、没有账号体系、没有许可证校验。
+装完之后断网，识别、整理、拼音全都照常。
 
 ### 本地会留下什么（介意可以删）
 
@@ -69,83 +72,57 @@
 
 ## 需要什么
 
-### 硬性条件
+### 直接用（推荐）：不用装 Python，不用命令行
 
-- Windows 10 / 11（x64）
-- Python **3.10 以上**（开发环境 3.13.14；安装时勾选 "Add python.exe to PATH"）
-- 磁盘：虚拟环境约 0.6–0.8 GB + 模型 0.9–2.0 GB + 运行产物若干
+- Windows 10 / 11（x64），不需要显卡、不需要 CUDA
+- 磁盘约 1.2 GB：程序 182 MB + 识别模型 940 MB（要书面化再加 940 MB）
 - 内存：识别常驻约 1.1 GB；开书面化再 +2.3 GB
-- 不需要显卡，不需要 CUDA
 
-### 仓库里有什么 / 什么靠下载 / 什么要自己装
+流程就三步：**下载一个 72 MB 的压缩包 → 解压 → 双击 `Verbalkey.exe`**。
 
-这是三件不同的事，分开说清楚：
+第一次启动会弹一个窗口，把「要下什么、多大、还剩多久」列清楚（识别模型 942 MB，
+书面化 964 MB，拼音 29 MB），你勾选后点一次「开始下载」。
+下完托盘出现粉色图标，按住右 Alt 说话就能上屏。**全程只点两次**（开始下载 / 完成）。
 
-**① 仓库里直接带着的（约 1 MB，77 个文件）**
+断网中断也没关系：下次打开会接着下，不会从头来。装完之后**全程离线**，不再联网。
+
+### 自己改代码 / 自己打包：需要 Python
+
+- Python 3.10 以上（开发环境 3.13.14，安装时勾选 "Add python.exe to PATH"）
+- 其余同上
+
+## 包里有什么（以及为什么不带模型）
+
+发布包 72 MB，解压 182 MB，里面只有：
 
 | 内容 | 说明 |
 |---|---|
-| `src/` | 全部源码 |
-| `tools/` | 模型下载器、自测与截图脚本 |
-| `assets/app.ico`、`assets/ime/*.ico` | 托盘图标、拼音中/英状态图标 |
-| `install.bat`、`run.bat`、`start.vbs`、`verbalkey.spec` | 安装、启动、打包 |
-| `LICENSE`、`README.md` | 说明与许可 |
+| `Verbalkey.exe` | 主程序 |
+| `_internal/` | 运行时（Python 解释器、PySide6、sherpa-onnx…打包时就带上了） |
+| `assets/rime/deployer/` | librime 官方部署器（BSD-3，4 MB，没有它没法自动重编译词库） |
+| `使用说明.txt` | 给不看 README 的人 |
 
-**② `install.bat` 自动下载的（脚本从官方源拉，不经过本项目）**
+**故意不带**的，首次运行按需下（也是为什么包只有 72 MB）：
 
-| 内容 | 大小 | 来源 |
+| 不带 | 大小 | 为什么 |
 |---|---|---|
-| 识别模型（3 个 onnx + 词表） | 938 MB | ModelScope `zengshuishui/Qwen3-ASR-onnx` |
-| Silero VAD | 632 KB | sherpa-onnx release |
-| 整理模型（可选） | 940 MB | ModelScope `botaruibo/MyVoiceTyping-1.5b-q4` |
-| llama.cpp 推理程序（可选） | 24 MB 包 / 83 MB 解压 | `ggml-org/llama.cpp` b11934 |
-
-**③ 需要你自己装 / 自己放的**
-
-| 内容 | 谁装 | 为什么不是自动的 |
-|---|---|---|
-| Python 3.10+ | **你自己装** | 装 Python 要改 PATH、动系统目录，静默安装失败时留下的问题比装不上更难查。宁可让你点一次 |
-| pip 依赖（5 个包） | `install.bat` 自动装 | 见下 |
-| 小狼毫引擎 + 雾凇词库（仅拼音功能需要） | **你自己放**（见[拼音输入](#拼音输入可选需要额外三个文件)） | 第三方 GPL 组件，65 MB，不做二次分发 |
-| VC++ 运行库 | 一般已自带 | 缺了会报 `找不到 VCRUNTIME140_1.dll`，装一次微软官方运行库即可 |
-
-**pip 依赖会自动装**，`install.bat` 会在仓库目录建 `.venv`（不动系统 Python），然后装：
-
-```
-sherpa-onnx                 2.0.1
-PySide6                     6.12.0
-sounddevice                 0.5.6
-numpy                       2.5.4
-opencc-python-reimplemented 0.1.7   （繁转简，可选，装不上也能跑）
-```
+| 识别模型 + VAD | 942 MB | 体积；且模型有各自许可证，不做二次分发 |
+| 书面化模型 + llama.cpp | 964 MB | 同上，而且不是所有人都要书面化 |
+| 小狼毫引擎 + 雾凇词库 | 29 MB | GPL-3.0 第三方二进制 |
+| `config.json` / `data/` / `logs/` | — | 属于别人机器上的隐私，绝不能进发布包 |
 
 ## 安装
 
-三步，都在仓库根目录。
+### 方式一：用发布包（普通用户）
 
-### 只想用语音（约 940 MB，最快能用）
+1. 从 [Releases](../../releases) 下 `Verbalkey-x.y.z-win64.zip`
+2. 解压到任意目录（建议纯英文路径，别放 `C://Program Files` —— 那里写不进模型）
+3. 双击 `Verbalkey.exe`，按窗口提示点「开始下载」
 
-1. 装 Python 3.10+（勾选 Add to PATH）
-2. 双击 `install.bat` —— 建 `.venv` → 装依赖 → 下识别模型 → 复查
-3. 双击 `start.vbs` 静默启动（或 `run.bat` 带控制台，调试用）
+不需要安装 Python，不需要管理员权限（只有装拼音引擎那一步会弹一次授权框）。
+整个文件夹可以拷到 U 盘或别的电脑，**挪位置要整个文件夹一起挪**，别只拷 exe。
 
-托盘出现粉色图标即表示在跑。这时按住右 Alt 说话，松开就上屏。
-
-### 连书面化一起装（约 1.9 GB）
-
-```
-install.bat full
-```
-
-它会额外拉整理模型和 llama.cpp。装完到 **设置 → 口述整理**，把强度调成「书面化」。
-
-已经装过语音版，只想补整理：
-
-```
-.venv\Scripts\python.exe tools\fetch_models.py --group polish,llama
-```
-
-### 手动装（已有 Python 环境）
+### 方式二：从源码跑（要改代码）
 
 ```bash
 python -m venv .venv
@@ -154,18 +131,22 @@ python -m venv .venv
 .venv\Scripts\python.exe entry.py
 ```
 
-### 模型下载器怎么用
+也可以直接跑 `install.bat`，它把上面三步串起来了（`install.bat full` 连书面化一起装）。
+只有这条路需要 Python。
+
+### 模型下载器
+
+引导窗口和命令行用的是同一份清单（`src/fetch.py`），也可以单跑：
 
 ```bash
-.venv\Scripts\python.exe tools\fetch_models.py --check        # 只看缺什么，不下载
-.venv\Scripts\python.exe tools\fetch_models.py --group vad,asr    # 只下识别
-.venv\Scripts\python.exe tools\fetch_models.py --all              # 全下（两个整理模型都下，占 2.1 GB）
-.venv\Scripts\python.exe tools\fetch_models.py --variant qwen3    # 整理模型换成 Qwen3-1.7B
+.venv\Scripts\python.exe tools\fetch_models.py --check          # 只看缺什么
+.venv\Scripts\python.exe tools\fetch_models.py --group vad,asr  # 只下识别
+.venv\Scripts\python.exe tools\fetch_models.py --group pinyin   # 只下拼音组件
+.venv\Scripts\python.exe tools\fetch_models.py --all            # 全下
 ```
 
-特性：**断点续传**（断了重跑接着下）、**已有的跳过**（不重复耗流量）、**多源回退**（ModelScope 不通换 GitHub）、**下完核对大小**。
-
-文件清单与来源见[模型](#模型)一节。
+特性：**断点续传**、**已有的跳过**、**多源回退**（ModelScope 不通换 GitHub 镜像）、
+**下完核对大小**。文件清单与来源见[模型](#模型)一节。
 
 ## 第一次使用
 
@@ -237,15 +218,27 @@ python -m venv .venv
 
 下面按"你可能卡在哪一步"排。
 
-### 第 1 步：`install.bat` 就跑不起来
+### 第 1 步：首次启动，下载这一步
+
+用发布包的人只会卡在这里，逐个症状对照：
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| 窗口闪一下就没了 | 没装 Python 或没加 PATH | 命令行敲 `python --version` 确认；装 Python 时勾 "Add to PATH" |
-| `创建失败` | 同上（或 `python` 指向了微软商店的占位程序） | 从 python.org 装正式版，装完重开命令行 |
-| 装依赖时超时 / 一片红 | pypi 网络问题 | 换清华源（脚本报错时已经把命令打出来了，直接复制粘贴） |
-| 模型下到一半失败 | 网络中断 | 再跑一次 `install.bat`，会接着下，不会从头来 |
-| `--check` 说某个文件"缺失"但文件在 | 大小对不上（半截文件） | 删掉那个文件重下；脚本只按大小判断，不看内容 |
+| 双击没反应，托盘也没图标 | 被杀软拦了，或解压不完整 | 看 `logs/crash.log`；重新解压一次；把整个文件夹加进杀软白名单 |
+| 弹窗提示"已经在运行" | 单实例锁，之前那份还没退 | 从托盘退出旧的那份。日志里会写 `检测到已有实例` |
+| 下载一直 0% 不动 | 连不上 ModelScope | 点「稍后再说」，等网络好了从托盘「下载模型与组件…」再来；已下的部分不会重来 |
+| 下到 90% 断了 | 网络中断 | 重新打开窗口点「重试」，会续传 |
+| 提示某些文件"没下完" | 校验没通过（大小不符） | 点「重试」；反复失败就删掉 `models/` 里那个文件重下 |
+| 装拼音时弹授权框 | 装引擎要管理员权限 | 点「是」。点了「否」就再点一次「安装拼音输入法」 |
+| 下载完仍提示找不到模型 | 目录写不进去 | 别放在 `C://Program Files`，挪到用户目录再试 |
+
+**从源码装的人**才会遇到下面这些（发布包没有这一步）：
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `install.bat` 闪一下就没了 | 没装 Python 或没加 PATH | 脚本现在会自己提示并给出下载地址 |
+| 装依赖超时 / 一片红 | pypi 网络问题 | 换清华源，脚本报错时已经把命令打出来了 |
+| 模型下到一半失败 | 网络中断 | 再跑一次 `install.bat`，会接着下 |
 
 ### 第 2 步：装完了，启动没反应
 
@@ -315,8 +308,14 @@ python -m venv .venv
 **会不会把我的话传上去？**
 不会，代码里没有上传路径。你在 `logs/app.log` 和 `data/hotwords/corpus.jsonl` 里能看到它到底存了什么——都是明文，随时能删。
 
-**为什么不做成安装包，双击就完事？**
-没做。现在需要先装 Python，是因为打包成独立安装器要额外维护 Python 运行时、模型下载、依赖冲突、卸载清理一整套，工作量比功能本身还大。以后可能会做。
+**为什么发 zip 而不是 setup.exe？**
+发 zip 只是因为「装 Python」这一步已经不存在了——运行时已经打进 `_internal/`，
+剩下只是复制文件。真正的 setup.exe 还要维护卸载、静默升级、权限和自动启动的边界情况，
+收益不如先把这件事做对。要卸载就关掉自启、退出、删文件夹（拼音另到系统设置里卸）。
+
+**发布包 72 MB 是不是少东西？**
+不少。少的是模型（942 MB 起），它在首次启动时下载。这样改代码不用重新发 1 GB 的包，
+模型换版本也不用重新发版。
 
 **能商用吗？**
 本项目代码 MIT。但随包/随下载的模型各有各的协议（Apache 2.0 / MIT / GPL-3.0），商用前自己核对上游原文，见[许可与来源](#许可与来源)。
@@ -329,7 +328,9 @@ python -m venv .venv
 
 ## 模型
 
-仓库里**不包含模型**（合计 2–3 GB，且各有各的许可证），也不用网盘。所有文件指向上游官方源，一条命令自动下、自动校验、自动放对位置。
+**用发布包的人不用看这一节**——首次启动的引导窗口会从这些地址自动下载。
+
+仓库里不包含模型（合计 2–3 GB，且各有各的许可证），也不用网盘。所有文件指向上游官方源，一条命令自动下、自动校验、自动放对位置。
 
 ### 文件清单与来源
 
@@ -360,26 +361,29 @@ models/silero_vad.onnx      ← 放 models/ 根目录，不是模型文件夹里
 
 网盘链接会失效、限速、没法校验完整性、也没有版本概念。而且这几个模型本来就有官方源，转存一遍只多了个会烂的中转站。
 
-## 拼音输入（可选，需要额外三个文件）
+## 拼音输入（可选）
 
 **只用语音的话，这一节可以跳过**——语音上屏不依赖拼音引擎。
 
-Verbalkey 可以顺带托管一套拼音输入（小狼毫引擎 + 雾凇拼音词库），这样语音和拼音共用一个「中/英」图标，候选窗样式也和语音浮窗统一。这三样都是第三方 GPL-3.0 组件，**不在仓库里**，需要自己放成这个结构：
+Verbalkey 可以顺带托管一套拼音输入（小狼毫引擎 + 雾凇拼音词库），
+这样语音和拼音共用一个「中/英」图标，候选窗样式也和语音浮窗统一。
 
-```
-assets/rime/
-├── installer/weasel-0.17.4.0-installer.exe    ← 官方安装包，约 12 MB
-├── ice/…                                      ← 雾凇拼音全套，约 49 MB
-└── deployer/{rime.dll, rime_deployer.exe}     ← librime 官方部署器，约 4 MB
-```
+**装法：设置 → 拼音输入法 → 「安装拼音输入法」，点一次就行。**
 
-- 安装包：[rime/weasel releases](https://github.com/rime/weasel/releases)
-- 词库：[iDvel/rime-ice](https://github.com/iDvel/rime-ice) 的源码 zip，解压到 `ice/`
-- 部署器：从已装的小狼毫安装目录复制 `rime.dll` 和 `rime_deployer.exe`
+它会自己做四件事，全程几十秒到两分钟：
 
-放好之后：设置 → 拼音输入法 → 「安装拼音输入法」。它会装引擎、铺词库、注册到语言栏，然后重新编译一次配置。
+1. 缺组件就现下（引擎安装包 11.9 MB + 词库 16.9 MB，从 GitHub / 镜像拉）
+2. 静默安装引擎 —— **会弹一次系统授权框，点「是」**，这是唯一需要你动手的地方
+3. 把词库铺到 `%APPDATA%\Rime`，改成 Verbalkey 的名字和图标
+4. 重新编译（1–2 分钟，这期间语音功能照常可用）
 
-词库以后有新版本，在同一个页面点「词库更新」即可（从 GitHub 拉，走系统代理）。
+词库以后有新版本，在同一个页面点「词库更新」即可。
+
+### 为什么不把这些打进发布包
+
+小狼毫和雾凇拼音都是 **GPL-3.0**。打进包等于替每个下载者承担 GPL 的源码提供义务，
+而它们本来就有官方源。所以发布包里只带 librime 的官方部署器（BSD-3，4 MB，
+没有它就没法自动重编译词库），其余运行时现下。
 
 ## 技术笔记
 
@@ -430,11 +434,12 @@ verbalkey/
 │   ├── paste.py       上屏三级降级
 │   ├── polish.py      整理层（llama.cpp + 规则兜底）
 │   ├── rime_setup.py  拼音引擎/词库/配置托管
-│   └── ui/            hud.py 浮窗、settings.py 设置界面、brand.py 图标
+│   ├── fetch.py       模型与组件的下载清单（引导窗口和命令行共用）
+│   └── ui/            hud.py 浮窗、settings.py 设置界面、firstrun.py 首次引导
 ├── models/            识别模型 + VAD + 整理 GGUF（下载，不入库）
 ├── bin/llama/         llama-server.exe（下载，不入库）
 ├── assets/            图标（入库）；rime/ 是拼音组件（不入库）
-├── tools/             fetch_models.py 下载器、build.py 打包、自测脚本
+├── tools/             fetch_models.py 下载命令、build.py 打包、release.py 发版
 ├── entry.py           打包入口（带崩溃日志）
 ├── verbalkey.spec     PyInstaller 配置
 ├── install.bat / run.bat / start.vbs
@@ -473,6 +478,20 @@ dist/Verbalkey/
 程序目录可以整个搬到别的电脑（Win10 以上、已装 VC++ 运行库）。首次运行会在程序目录建 `logs/`，崩溃会写 `logs/crash.log`。
 
 配置里的模型路径优先用存在的绝对路径，找不到就按 `bin/` / `models/` 重新拼到程序目录下——所以整包搬迁后整理功能不会失效。
+
+### 打发布包
+
+```
+python tools/release.py --build     # 先打包再压 zip
+python tools/release.py             # 用现有 dist 直接压
+```
+
+产物：`release/Verbalkey-<版本>-win64.zip`，约 72 MB。脚本会自动剔除
+`models/`、`bin/`、`data/`、`logs/`、`config.json` 和拼音的原始组件
+（安装包 + 词库），并复查一遍确认运行时齐全、隐私文件没混进去。
+把 zip 挂到 GitHub Release 即可。
+
+版本号在 `src/config.py` 的 `APP_VERSION`，改一处就行。
 
 ## 许可与来源
 
