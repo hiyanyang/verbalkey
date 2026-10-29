@@ -36,53 +36,83 @@
 
 ## 安装
 
-需要 Windows 10/11 + Python 3.10 以上（安装时勾选加入 PATH）。
+需要 Windows 10/11 + Python 3.10 以上（安装时勾选「Add to PATH」）。
 
 1. 把仓库克隆/解压到一个目录（建议纯英文路径，个别库对中文路径处理不一致）
-2. 双击 `install.bat`：建 `.venv`、装依赖、下载 VAD 模型
-3. 按下一节把识别模型放进 `models/`，再按「口述整理怎么配」放整理模型
-4. 双击 `start.vbs` 静默启动，或 `run.bat` 带控制台启动（调试用）
+2. 双击 `install.bat` —— 建 `.venv`、装依赖、下模型，一条龙
+3. 双击 `start.vbs` 静默启动（或 `run.bat` 带控制台，调试用）
 
-托盘里出现粉色图标即表示运行。`install.bat` 只需要跑一次。
+托盘里出现粉色图标即表示运行。`install.bat` 只要跑一次。
+
+`install.bat` 默认只装识别功能（约 940 MB），装完按住右 Alt 说话就能上屏。
+想要「去口水词 / 整理成书面语」，装的时候用 `install.bat full`（约 1.9 GB），
+或者装完再补一条：
+
+```bash
+python tools/fetch_models.py --group polish,llama
+```
+
+模型下载可以中断，重跑 `install.bat` 会接着下，不会从头来。
 
 ## 模型
 
-仓库里**不包含模型**（3.1 GB，且各有各的许可证）。需要自己下载，放对位置即可。
+仓库里**不包含模型**（合计约 3 GB，且各有各的许可证），但也不用你自己找网盘。
+所有文件都指向上游官方源，一条命令自动下、自动校验、自动放对位置。
 
-### 识别模型（必需，约 950 MB）
+### 一条命令
 
 ```bash
-curl -L -O https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25.tar.bz2
-tar xjf sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25.tar.bz2
-mv sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25 models/
-curl -L -o models/silero_vad.onnx https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
+python tools/fetch_models.py --check     # 先看缺什么
+python tools/fetch_models.py --group vad,asr       # 只装识别（约 940 MB）
+python tools/fetch_models.py --all                 # 连整理一起（约 1.9 GB）
 ```
 
-解压后目录里应该有：
+`install.bat` 已经内置这一步，装的时候会自己跑。
+
+特性：断点续传（断了重跑接着下）、已有的跳过（不重复占流量）、
+多源回退（ModelScope 不通换 GitHub）、完成后核对大小。
+
+### 文件清单与来源
+
+| 文件 | 大小 | 来源 |
+|---|---|---|
+| `models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/` | 938 MB | [ModelScope](https://modelscope.cn/models/zengshuishui/Qwen3-ASR-onnx) 的 `model_0.6B/` 下 3 个 onnx + `tokenizer/` 下 vocab.json、merges.txt |
+| `models/silero_vad.onnx` | 632 KB | [sherpa-onnx release](https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models) |
+| `models/polish/MyVoiceTyping-1.5B-Q4_K_M.gguf` | 940 MB | [ModelScope](https://modelscope.cn/models/botaruibo/MyVoiceTyping-1.5b-q4)，专为中文语音输入微调（MIT） |
+| `models/polish/Qwen3-1.7B.Q4_K_M.gguf` | 1.2 GB | [ModelScope](https://modelscope.cn/models/QuantFactory/Qwen3-1.7B-GGUF)，通用模型，可替代上一个 |
+| `bin/llama/`（含 `llama-server.exe`） | 24 MB 包 / 83 MB 解压 | [llama.cpp release](https://github.com/ggml-org/llama.cpp/releases) `b11934` 的 win-cpu-x64 包 |
+
+整理模型**二选一**即可，不用都下。推荐 MyVoiceTyping：小 280 MB，且是针对
+「语音转写文本 → 通顺书面语」训练过的；Qwen3-1.7B 是通用模型，也能用但没那么对口。
+
+解压后的识别模型目录应该长这样：
 
 ```
-conv_frontend.onnx
-encoder.int8.onnx
-decoder.int8.onnx
-tokenizer/{vocab.json, merges.txt}
-silero_vad.onnx      ← 放 models/ 根目录，不是模型文件夹里面
+models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/
+├── conv_frontend.onnx
+├── encoder.int8.onnx
+├── decoder.int8.onnx
+└── tokenizer/{vocab.json, merges.txt}
+models/silero_vad.onnx      ← 放 models/ 根目录，不是模型文件夹里面
 ```
 
 设置 → 识别模型 → 下拉框选中它，点「重载识别模型」。窗口每次打开都会重扫目录，
 新拷进去的模型不用重启软件。
 
-**下载慢的坑**：GitHub release 走代理只有约 70 KB/s，838 MB 要 3 小时。
-用迅雷 / IDM 拉会快很多；国内源（ModelScope）只有 transformers 原始格式，
-不是 sherpa-onnx 要的 ONNX 包，别下错。
+### 为什么不用网盘
 
-### 整理模型（可选，只有「书面化」档才用）
+网盘链接会失效、限速、没法校验完整性、也没有版本概念——项目换个模型版本，
+别人下的还是旧的。而且这几个模型本来就有官方源，转存一遍只多了个会烂的中转站。
 
-- `Qwen3-1.7B-Q4_K_M.gguf`（约 1.2 GB）：从 Qwen 官方 GGUF 仓库下载 Q4_K_M 量化版，
-  放 `models/polish/`
-- `llama-server.exe` 和同目录的 dll：从 llama.cpp 的 Windows 发布包取（实测 build 11934），
-  放 `bin/llama/`
+**网盘只适合一种情况**：某个上游源真的挂了，且短时间修不好。真到那时候，
+再在 Release 里挂一份（24 MB 的 llama 包可以，1 GB 的模型不适合）。
 
-不装也能用：设置 → 口述整理 → 强度选「关闭」或「去口水词」，这两档不跑大模型。
+### 网络说明
+
+- ModelScope 在国内直连，通常能跑满带宽
+- GitHub 的 `release` 域名在国内经常连不上或只有几十 KB/s，
+  这时 `bin/llama` 那 24 MB 会卡住；脚本会自动换下一个源
+- 全部走 HTTP，不需要登录、不需要 token
 
 ## 使用
 
@@ -268,5 +298,19 @@ dist/Verbalkey/
 
 ## 许可与来源
 
-自己写的代码随意使用。模型部分遵循各自协议：
-Qwen3-ASR（Apache 2.0）、sherpa-onnx（Apache 2.0）、llama.cpp（MIT）。
+本项目代码：MIT，见 [LICENSE](LICENSE)。
+
+模型不在仓库里，也不做二次分发——`tools/fetch_models.py` 只是替你从上游拉。
+各模型的许可由各自作者决定：
+
+| 组件 | 许可 | 出处 |
+|---|---|---|
+| sherpa-onnx | Apache 2.0 | [k2-fsa/sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) |
+| Qwen3-ASR-0.6B | Apache 2.0 | [QwenLM/Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR)，ONNX 导出 [Wasser1462](https://github.com/Wasser1462/Qwen3-ASR-onnx) |
+| Silero VAD | MIT | [snakers4/silero-vad](https://github.com/snakers4/silero-vad) |
+| MyVoiceTyping-1.5B | MIT | [botaruibo/MyVoiceTyping](https://github.com/botaruibo/MyVoiceTyping) |
+| Qwen3-1.7B | Apache 2.0 | [Qwen/Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B) |
+| llama.cpp | MIT | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) |
+
+商用前请各自核对上游协议原文。
+
