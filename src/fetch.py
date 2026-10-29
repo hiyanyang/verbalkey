@@ -51,12 +51,29 @@ CHUNK = 1024 * 256
 TIMEOUT = 30
 RETRY = 3
 
-MS = "https://modelscope.cn/models/{repo}/resolve/master/{path}"
+MS = "https://modelscope.cn/models/{repo}/resolve/{rev}/{path}"
 GH = "https://github.com/{repo}/releases/download/{tag}/{file}"
 # GitHub 在国内经常只有几十 KB/s 甚至连不上，走一层镜像重试
 GHP = "https://gh-proxy.com/https://github.com/{repo}/releases/download/{tag}/{file}"
 
 ASR_DIR = "sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25"
+
+# ---- 版本固定（别改回 master）----
+#
+# ModelScope 的 master 是滚动的，而且**同一仓库里不同文件来自不同提交**：
+# 实测这个 ASR 仓库的 encoder 是 2026-03-24 传的，decoder 是 04-07 传的，
+# 差了两周。跟着 master 走的话，两个人不同时间装、或者上游后来换了某一个
+# 文件，下到的东西就不一样——但本地判断只看体积（容差 max(3MB, 5%)，
+# decoder 的 5% 就是 36MB），换了也照样判「已有、跳过」，于是新老用户
+# 拿到的不是同一套，出问题无法复现。
+#
+# 固定到提交哈希后，URL 的内容永久不变，所有用户下到同一串字节。
+# 代价：上游改进了这里也不会自动生效，要让用户升级得改常量 + 重新发版。
+# 每个值后面记的是该提交的日期，方便判断有多旧。
+ASR_REV_MODEL = "c69fb1666ccb59a82c09840c511a6c894e6a2482"      # 2026-03-24
+ASR_REV_DECODER = "de9e449eb376dcb472c1ce8141fbae8d524fabbd"    # 2026-04-07
+POLISH_REV_MVT = "3be3b98d9f1e4c784f708ead10d09bcb7290531d"      # 2026-07-02
+POLISH_REV_QWEN3 = "a9b8d97b86988145b4c3f52514dbb27b0bc1621b"    # 2025-09-17
 
 WEASEL_VER = "0.17.4"
 WEASEL_FILE = f"weasel-{WEASEL_VER}.0-installer.exe"
@@ -106,6 +123,7 @@ def groups() -> dict[str, list[dict]]:
                 "mb": 42.1,
                 "label": "识别模型 1/5",
                 "urls": [MS.format(repo="zengshuishui/Qwen3-ASR-onnx",
+                                   rev=ASR_REV_MODEL,
                                    path="model_0.6B/conv_frontend.onnx")],
             },
             {
@@ -113,6 +131,7 @@ def groups() -> dict[str, list[dict]]:
                 "mb": 174.0,
                 "label": "识别模型 2/5",
                 "urls": [MS.format(repo="zengshuishui/Qwen3-ASR-onnx",
+                                   rev=ASR_REV_MODEL,
                                    path="model_0.6B/encoder.int8.onnx")],
             },
             {
@@ -120,6 +139,7 @@ def groups() -> dict[str, list[dict]]:
                 "mb": 720.9,
                 "label": "识别模型 3/5（最大，最慢）",
                 "urls": [MS.format(repo="zengshuishui/Qwen3-ASR-onnx",
+                                   rev=ASR_REV_DECODER,
                                    path="model_0.6B/decoder.int8.onnx")],
             },
             {
@@ -127,6 +147,7 @@ def groups() -> dict[str, list[dict]]:
                 "mb": 2.6,
                 "label": "识别模型 4/5",
                 "urls": [MS.format(repo="zengshuishui/Qwen3-ASR-onnx",
+                                   rev=ASR_REV_MODEL,
                                    path="tokenizer/vocab.json")],
             },
             {
@@ -134,6 +155,7 @@ def groups() -> dict[str, list[dict]]:
                 "mb": 1.6,
                 "label": "识别模型 5/5",
                 "urls": [MS.format(repo="zengshuishui/Qwen3-ASR-onnx",
+                                   rev=ASR_REV_MODEL,
                                    path="tokenizer/merges.txt")],
             },
         ],
@@ -144,6 +166,7 @@ def groups() -> dict[str, list[dict]]:
                 "mb": 940.4,
                 "label": "书面化模型（推荐）",
                 "urls": [MS.format(repo="botaruibo/MyVoiceTyping-1.5b-q4",
+                                   rev=POLISH_REV_MVT,
                                    path="MyVoiceTyping-1.5B-Q4_K_M.gguf")],
                 "either": "polish", "variant": "myvoicetyping", "default": True,
                 "note": "专为中文语音输入微调",
@@ -153,6 +176,7 @@ def groups() -> dict[str, list[dict]]:
                 "mb": 1223.0,
                 "label": "书面化模型（通用 1.7B）",
                 "urls": [MS.format(repo="QuantFactory/Qwen3-1.7B-GGUF",
+                                   rev=POLISH_REV_QWEN3,
                                    path="Qwen3-1.7B.Q4_K_M.gguf")],
                 # 上游文件名带点，很多人本地存成横线版，当成同一个东西
                 "aliases": [MODELS_DIR / "polish" / "Qwen3-1.7B-Q4_K_M.gguf"],
