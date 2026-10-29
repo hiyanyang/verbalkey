@@ -20,11 +20,33 @@ echo ============================================
 echo.
 
 echo [1/4] 创建虚拟环境：%VK_VENV%
+rem 先确认 python 能用。很多人卡在这里：装的时候没勾 Add to PATH，
+rem 或者命令行里 python 指向了微软商店的占位程序。
+where python >nul 2>nul
+if errorlevel 1 (
+  echo.
+  echo 找不到 python。请先装 Python 3.10 以上，安装时勾选 "Add python.exe to PATH"：
+  echo   https://www.python.org/downloads/windows/
+  echo.
+  echo 装完关掉这个窗口重新双击 install.bat。
+  pause
+  exit /b 1
+)
+python -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" >nul 2>nul
+if errorlevel 1 (
+  echo.
+  echo 当前 python 版本低于 3.10，或者是个占位程序。请装 3.10 以上版本：
+  echo   https://www.python.org/downloads/windows/
+  python --version
+  pause
+  exit /b 1
+)
 if not exist "%VK_VENV%\Scripts\python.exe" (
   python -m venv "%VK_VENV%"
 )
 if not exist "%VK_VENV%\Scripts\python.exe" (
-  echo 创建失败。确认已安装 Python 3.10+ 并加入 PATH。
+  echo 创建虚拟环境失败。多半是权限或磁盘问题，换个目录重试，或手动执行：
+  echo   python -m venv .venv
   pause
   exit /b 1
 )
