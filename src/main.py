@@ -10,6 +10,8 @@ import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+import numpy as np
+
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
@@ -82,6 +84,29 @@ def _similar(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
     return SequenceMatcher(None, a, b, autojunk=False).ratio()
+
+
+def _voiced_sec(x: np.ndarray, sr: int) -> float:
+    """算这段音频里「真有声音」的时长，跳过静音。
+
+    为什么不用总时长判 30 秒上限：整轮缓冲现在收的是麦克风全程音频，
+    段间停顿全在里面。用户中途想事情停 10 秒，总时长会顶过 30 秒，
+    但模型实际要解的语音只有 20 秒 —— 按总时长判就会白白放弃重解。
+    阈值与 audio._trim_silence 一致（20ms 帧、max(0.004, 峰值×0.08)），
+    这样两边对「什么算有声」的判断不会打架。
+    """
+    if sr <= 0 or len(x) == 0:
+        return 0.0
+    frame = max(1, int(sr * 0.02))
+    n = len(x) // frame
+    if n < 2:
+        return len(x) / sr
+    rms = np.sqrt(np.mean(x[:n * frame].reshape(n, frame) ** 2, axis=1))
+    peak = float(rms.max())
+    if peak < 0.004:
+        return 0.0
+    thr = max(0.004, peak * 0.08)
+    return float(np.count_nonzero(rms > thr)) * frame / sr
 
 
 def _join_segments(parts: list[tuple[str, int]]) -> str:
@@ -678,20 +703,23 @@ class App:
         失败、超长、或用户已经在说下一段，一律退回草稿 —— 绝不让它比现在更差。
         """
         sr = int(CONFIG.get("audio", "sample_rate"))
-        # 整轮缓冲存的是原始音频（未削静音），里面含按键前 0.8 秒预缓冲和段间
-        # 所有停顿。两头削一次：太长的静音引子会让模型顺着热词 prompt 往下编
-        # （实测有一段前面拖了 6.5 秒静音）。只削两头，中间的停顿是真停顿。
+        # 整轮缓冲存的是**全程音频**：麦克风收到的每一块，不等 VAD 判断。
+        # 所以里面含按键前 0.8 秒预缓冲和段间所有停顿。两头削一次：太长的
+        # 静音引子会让模型顺着热词 prompt 往下编（实测有一段前面拖了 6.5 秒
+        # 静音）。只削两头，中间的停顿是真停顿 —— 它也是断句的依据。
         # 尾部补齐不在这里做 —— 那是解码层的事（asr._TAIL_PAD_SEC），
         # 放这儿会被削掉。
         clean = _trim_silence(utterance, sr)
         if len(clean) < len(utterance):
             log.info("整段重解前削掉首尾静音 %.2fs → %.2fs",
                      len(utterance) / sr, len(clean) / sr)
-        # 上限按削过之后的长度算：说话的净长度才是模型要吃的量
-        secs = len(clean) / max(sr, 1)
+        # 上限按**有声时长**判（见 _voiced_sec）：整轮缓冲含段间全部停顿，
+        # 按总时长判会让「中途想过事情」的录音白白放弃重解。
+        secs = _voiced_sec(clean, sr)
+        total = len(clean) / max(sr, 1)
         if secs > _MAX_REDECODE_SEC:
-            log.info("跳过整段重解：音频 %.1fs 超过 %.0fs 上限（再长会被模型截断）",
-                     secs, _MAX_REDECODE_SEC)
+            log.info("跳过整段重解：有声 %.1fs（总长 %.1fs）超过 %.0fs 上限",
+                     secs, total, _MAX_REDECODE_SEC)
             return draft
         if self.busy:
             log.info("跳过整段重解：已经在录下一段")
@@ -715,8 +743,8 @@ class App:
             text = hotwords.apply_corrections(text)
         except Exception as e:
             log.warning("应用纠正表失败（忽略）：%s", e)
-        log.info("整段重解 %.1fs 音频，耗时 %.2fs：分段 %d 字 → 整段 %d 字",
-                 secs, dt, len(draft), len(text))
+        log.info("整段重解 %.1fs 有声（总长 %.1fs），耗时 %.2fs：分段 %d 字 → 整段 %d 字",
+                 secs, total, dt, len(draft), len(text))
         return text
 
     def _polish_async(self, text: str, level: int, seq: int, utterance=None):

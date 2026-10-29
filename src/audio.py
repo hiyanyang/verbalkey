@@ -83,6 +83,7 @@ class Recorder:
     PREROLL_SEC = 0.80    # 按键前的预缓冲（0.4 秒救不回「先开口再按键」的半个词）
     TAIL_SEC = 0.50       # 松键后继续收多久：尾音拖得比想象中长，0.35 仍会吃掉半个字
     MIN_TAIL_SEC = 0.30   # 尾音收尾的基准时长，_flush_pending 取它的 1/5 来挡碎片
+    ALL_MAX_SEC = 300     # 全程缓冲上限。超过 30s 本来就不重解，这只是防异常占内存
 
     def __init__(self, vad_model: str, sample_rate: int, vad_cfg: dict,
                  device=None, on_segment: Callable[[np.ndarray], None] = None,
@@ -128,16 +129,21 @@ class Recorder:
         self._pending: list[tuple[np.ndarray, int]] = []   # (音频, 距离上一段的静音采样数)
         self._last_end = 0      # 上一段在 VAD 输入流里的结束位置（采样点）
 
-        # 整轮录音的全部音频，**未削静音**。松键后拿它整段重解一次。
-        # VAD 分段 → 每段独立解码，上下文在边界处断掉，跨边界的词两半各解一次
-        # 就会丢字（线上日志实测：「长句子断句吧，个断句还是…」丢了「这」）。
-        # 整段重解上下文完整，是这条链路的正解，代价是多 1~2 秒。
+        # 整轮录音的**全程音频**：麦克风收到的每一块都进来，不等 VAD 判断。
+        # 松键后拿它整段重解一次。
         #
-        # 存原始音频而不是削过的，是因为 _trim_silence 只留 200ms 首尾：
-        # 实测同一段音频「尾部静音 200ms → 末字丢；补到 500ms → 末字回来」
-        # （树杈 → 树）。削过再拼接等于把重解的输入先破坏一次，边界上的字
-        # 永远救不回来，日志里「分段 81 字 → 整段 80 字」就是这么来的。
-        self._utterance: list[np.ndarray] = []
+        # 为什么必须收全程、而不是「VAD 判过有声音的段」：
+        # VAD 的 min_speech_ms 是 400ms，短于它的语音段会被**丢弃**（silero
+        # 官方语义：「短于此值的语音段丢弃」，官方默认 250、短句建议 100~250）。
+        # 中文一个字的时长约 150~250ms，所以一个被两侧停顿夹住的单字会被判成
+        # 噪声扔掉。这种字既不在分段队列（草稿）里、也不在整段缓冲里 —— 线上
+        # 实测「识别锁被[占]十秒以上」两次独立识别都少同一个字，就是这个。
+        #
+        # 收全程之后，VAD 丢掉的字仍然在重解用的音频里，能救回来。
+        # 分段草稿仍走 VAD 段（那是对的：草稿要快，不能整段解）。
+        self._all_buf: list[np.ndarray] = []
+        self._all_len = 0
+        self._all_max = int(self.ALL_MAX_SEC * sample_rate)
         self._utt_lock = threading.Lock()
 
     def _emit_error(self, msg: str):
@@ -188,32 +194,40 @@ class Recorder:
         # 模型会拿它当引子往下编（日志里表现为把热词表念出来）
         #
         # 但整段缓冲收的是**削之前**的原始音频：重解要的是真实录音，
-        # 削首尾会把句尾那 300ms 静音一起剪掉，末字就没了（见 _utterance 注释）。
+        # 削首尾会把句尾那 300ms 静音一起剪掉，末字就没了（见 _all_buf 注释）。
         buf = _trim_silence(raw, self.sample_rate)
         if len(buf) < int(0.20 * self.sample_rate):
             return False                # 削完不剩什么，说明这段基本是静音
         # 先攒进整轮缓冲，再入队：入队后取数线程可能立刻解完并通知收尾，
         # 那时候再补就漏了最后一段。
-        # 传 raw 不传 buf —— raw 是这个 _push 收到的全部原始样本。
-        self._append_utterance(raw)
         self._segments.put((buf, forced, first_gap))
         return True
 
-    def _append_utterance(self, buf: np.ndarray) -> None:
-        """攒整轮原始音频。分段缓冲和它共用同一份，别在这里做任何加工。"""
-        if buf.size == 0:
+    def _append_all(self, samples: np.ndarray) -> None:
+        """把麦克风收到的一块音频记进全程缓冲。
+
+        必须 copy：`samples` 是 sounddevice 回调里 indata 的视图，
+        底层缓冲区会被下一次回调覆盖，不拷贝就只剩最后一抖的声音。
+        `_acc` 那边同样是 copy 的，原因一样。
+        """
+        if samples.size == 0:
             return
         with self._utt_lock:
-            self._utterance.append(buf)
+            if self._all_len >= self._all_max:
+                return                      # 异常长的录音，不再往里堆
+            self._all_buf.append(samples.copy())
+            self._all_len += len(samples)
 
     def take_utterance(self) -> np.ndarray | None:
-        """取走这一轮录音的全部音频，取完即清空。
+        """取走这一轮录音的全程音频，取完即清空。
 
-        只有在 `_drain` 收尾之后调用才拿得全 —— 那时队列已空、`_closing`
-        已置位，不会再有新段进来。
+        收的是麦克风收到的每一块（见 _all_buf 注释），不是 VAD 段 ——
+        VAD 丢弃的短字也在这里。只有在 `_accepting` 已置 False 之后调用
+        才拿得全：那之后再不会有新块进来。
         """
         with self._utt_lock:
-            parts, self._utterance = self._utterance, []
+            parts, self._all_buf = self._all_buf, []
+            self._all_len = 0
         if not parts:
             return None
         return parts[0] if len(parts) == 1 else np.concatenate(parts)
@@ -234,7 +248,6 @@ class Recorder:
         self._pending = []
         # 只挡真正的碎片：不到 60ms 的音发不出完整的字，送进去只会出乱码
         if len(buf) >= self.min_tail_samples // 5:
-            self._append_utterance(buf)
             self._segments.put((buf, False, first_gap))
 
     def _callback(self, indata, frames, time_info, status):
@@ -254,6 +267,10 @@ class Recorder:
         with self._lock:
             if not self._accepting:
                 return
+            # 每一块都进全程缓冲：VAD 会按 min_speech_ms(400ms) 丢弃短语音段，
+            # 被丢的字在草稿和重解里都会消失（线上实测丢过「占」）。
+            # 收全程才能让重解拿到真实录音。
+            self._append_all(samples)
             try:
                 self.vad.accept_waveform(samples)
                 # 路径 1：VAD 判定的句子结尾
@@ -375,9 +392,10 @@ class Recorder:
             self._closing = False
             self._reset_acc()
             self._pending = []
-            # 新一轮：清掉上一轮留下的整段音频，否则重解会把两段话拼在一起
+            # 新一轮：清掉上一轮留下的全程音频，否则重解会把两段话拼在一起
             with self._utt_lock:
-                self._utterance = []
+                self._all_buf = []
+                self._all_len = 0
             # 新一轮从零开始算静音间隔。中途 vad.reset() 不清，那之后是
             # 「一口气继续往下说」，本来就该按无停顿处理
             self._last_end = 0
@@ -387,9 +405,12 @@ class Recorder:
             self._armed = True
             self._accepting = True
             if pre:
+                # 预缓冲是按键前的真实声音，属于这一轮：既要进 VAD，
+                # 也要进全程缓冲（VAD 可能判它太短而丢掉，重解得有）
                 self._acc.extend(pre)
                 try:
                     for blk in pre:
+                        self._append_all(blk)
                         self.vad.accept_waveform(blk)
                 except Exception:
                     pass
