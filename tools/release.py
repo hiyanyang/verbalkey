@@ -50,17 +50,37 @@ SKIP_DIR_NAMES = {"__pycache__", ".pytest_cache"}
 README_TXT = """Verbalkey {ver} —— Windows 本地语音输入
 ==========================================
 
-怎么用
-------
-1. 双击 Verbalkey.exe
-2. 第一次启动会弹一个窗口，列出要下载的东西（识别模型约 940 MB，
-   想连拼音打字一起用就把「拼音输入法」那行也勾上，再 +29 MB）
-   点一次「开始下载并安装」，等它下完、装完。全程只需要你点确认。
+安装（四步）
+------------
+1. 先把下载到的 zip 解压出来
+   在压缩包上右键 → 「全部解压缩」→ 选一个位置（桌面、文档、D 盘都行）
+2. 进解压出来的 Verbalkey 文件夹，双击 Verbalkey.exe
+3. 第一次启动会弹一个窗口，列出要下载的东西（识别模型约 940 MB，
+   想连拼音打字一起用就把「拼音输入法」那行也勾上，再 +29 MB），
+   点一次「开始下载并安装」，等它下完装完。
    断网了也没关系，重开会接着下，已经下好的一部分不会重来。
-3. 托盘出现粉色图标后，按住右 Alt 说话，松开就上屏。
+4. 托盘出现粉色图标后，按住右 Alt 说话，松开就上屏。
 
-不需要安装 Python，也不需要命令行。整个文件夹可以拷到 U 盘或别的电脑。
-想挪位置就整个文件夹一起挪，别只拷 exe。
+全程只需要你点两次：一次「开始下载并安装」，
+一次装拼音时 Windows 弹的管理员授权框（点「是」）。
+
+这三个错别犯
+------------
+x 在压缩包的预览窗口里直接双击 Verbalkey.exe
+  会报「找不到 xxx.dll」或者闪一下就没了 —— 那样文件还没真正落地。
+  必须先解压，再进解压出来的文件夹里双击。
+
+x 解压到 C:\\Program Files 或 C:\\Windows 下面
+  那两个目录普通权限写不进去，模型会下不下来，装完提示找不到模型。
+  解压到桌面、文档、D 盘都行，路径里别带空格和特殊符号最稳。
+
+x 只把 Verbalkey.exe 单独拷到别的地方
+  它自己只有 4.7 MB，真正的东西在旁边的 _internal 文件夹里，单拷必报错。
+  要挪位置、要拷到 U 盘，整个 Verbalkey 文件夹一起挪。
+
+不需要安装 Python，也不需要命令行。
+解压后应该是 Verbalkey\\Verbalkey.exe 这一层；如果解压出来是
+Verbalkey\\Verbalkey\\Verbalkey.exe，多套了一层，进里层那个就行。
 
 第一次用之前
 ------------
@@ -151,8 +171,10 @@ def main() -> int:
     shutil.rmtree(STAGE, ignore_errors=True)
     target = STAGE / "Verbalkey"
     n = _copy(DIST, target)
+    # utf-8-sig（带 BOM）：Windows 记事本靠 BOM 判断编码，没有 BOM 的老版本
+    # 会按 ANSI 读，整篇中文变乱码。加 3 个字节的 BOM 就能让所有编辑器都认。
     (target / "使用说明.txt").write_text(
-        README_TXT.format(ver=APP_VERSION), encoding="utf-8")
+        README_TXT.format(ver=APP_VERSION), encoding="utf-8-sig")
     print(f"  {n} 个文件")
 
     size = sum(p.stat().st_size for p in target.rglob("*") if p.is_file())
