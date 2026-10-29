@@ -273,13 +273,6 @@ class FirstRunDialog(QDialog):
             need = mb > 0 or (bool(opt.get("install")) and not pinyin_installed())
             cb.setEnabled(not opt["required"] and need)
 
-    def _selected_groups(self) -> list[str]:
-        out: list[str] = []
-        for opt, cb, _ in self._rows:
-            if cb.isChecked():
-                out.extend(opt["groups"])
-        return out
-
     def _wants_pinyin(self) -> bool:
         for opt, cb, _ in self._rows:
             if opt.get("install"):
@@ -424,18 +417,36 @@ class FirstRunDialog(QDialog):
             pass
         self.btn_go.clicked.connect(self.accept)
 
-    def _on_later(self) -> None:
-        if self.worker is not None:
-            self.worker.cancel()
-            self.worker.wait(3000)
+    def _stop_worker(self) -> bool:
+        """请求停下。返回 True 表示线程确实停了。
+
+        下载阶段随时能停（每 256 KB 检查一次 stop）。但**安装阶段掐不断**：
+        `rime_setup.setup_all` 里等引擎装完最多 240 秒、编译词库 1–2 分钟，
+        这些都在别人的进程里跑，没法中途打断。所以这里是「尽力等 3 秒，
+        没停就告诉你还没停」——绝不把还在跑的 QThread 丢给垃圾回收，
+        那样线程会在已经析构的窗口上发信号，直接崩。
+        """
+        if self.worker is None:
+            return True
+        self.worker.cancel()
+        if self.worker.wait(3000):
             self.worker = None
-        self.reject()
+            return True
+        return False
+
+    def _on_later(self) -> None:
+        if self._stop_worker():
+            self.reject()
+            return
+        self.lbl_state.setVisible(True)
+        self.lbl_state.setText("正在安装，没法中途停，请等它跑完（最多两分钟）")
 
     def closeEvent(self, e) -> None:
-        if self.worker is not None:
-            self.worker.cancel()
-            self.worker.wait(3000)
-            self.worker = None
+        if not self._stop_worker():
+            e.ignore()
+            self.lbl_state.setVisible(True)
+            self.lbl_state.setText("正在安装，没法中途停，请等它跑完（最多两分钟）")
+            return
         super().closeEvent(e)
 
 
