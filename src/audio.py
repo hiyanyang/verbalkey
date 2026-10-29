@@ -163,13 +163,16 @@ class Recorder:
         self.max_segment_samples = int(
             float(vad_cfg.get("max_segment_s", 20)) * sample_rate)
         self.min_tail_samples = int(self.MIN_TAIL_SEC * sample_rate)
-        # 碰到这么长的停顿时，攒着的段先单独送出去，不再往后合并。
+        # 碰到这么长的停顿、且已经攒够 min_asr_sec 时，攒着的段先单独送出去。
         # 0.70 秒与 main._GAP_COMMA 是同一个值（那里按它断逗号），两边必须
         # 同步：这里不断开，那处停顿就到不了 _join_segments，判据等于白设。
         #
-        # 代价（实测已知）：断开意味着前一段可能短于 min_asr_sec(3 秒)、要
-        # 单独送识别，而短段没有上下文、同音字更容易错。这是「断句准」和
-        # 「识别准」之间的取舍 —— 用户 2026-10-30 明确要断句准。
+        # 「还得攒够 min_asr_sec」这个附加条件是为了识别准确率：短句一断开
+        # 就得单独送识别，没有上下文，同音字错得厉害（实测修前 21.9% / 43.7%，
+        # 修后 0.7% / 1.9%）。用户 2026-10-30 定调「识别准是根本，断句其次」，
+        # 所以短句宁可不在这里断开，继续合并让模型自己在段内按静音断句。
+        # 代价：短句之间的停顿到不了 _join_segments，那里只剩「直接接上」，
+        # 标点全靠模型给（它听得到静音，实测标点没少）。
         self._split_gap_samples = int(0.70 * sample_rate)
         self._pending: list[tuple[np.ndarray, int]] = []   # (音频, 距离上一段的静音采样数)
         # 上一段语音在这个**绝对坐标系**里的结束位置（采样点）。
@@ -244,14 +247,28 @@ class Recorder:
         forced=True 表示这段是硬切出来的（不是自然句尾），调用方据此
         知道「后面还有下文」，不会在中间加句号。
 
-        **碰到句号级停顿就先断开，不并进去。** 合并会把中间的停顿一起吞掉：
+        **碰到停顿先断开，不并进去。** 合并会把中间的停顿一起吞掉：
         实测（2026-10-30）1.08 秒那段带着 0.08 秒间隔、2.46 秒那段带着
         2.50 秒间隔，并成一段之后只剩第一段的 0.08 秒 —— 那处明显的换气
-        就被吃掉了，文本里该断句号的地方只能落到逗号。断开之后每段各带
-        各的 gap 走，_join_segments 才拿得到真实间隔。
+        就被吃掉了。断开之后每段各带各的 gap 走，_join_segments 才拿得到
+        真实间隔。
+
+        **但只有攒够了（≥ min_asr_sec）才允许断开。** 断开就意味着前面那段
+        要单独送识别，而段越短、模型能看到的上下文越少，同音字越容易错。
+        实测（tools/probe_short_cer.py，真实语音切 1.5 秒小片、片间插 0.9 秒
+        停顿，以「整段一次解」为参照算 CER）：
+          · 每片单独送（段均 1.6 秒）→  21.9% / 43.7%
+          · 攒到 3 秒再送（段均 3.5 秒）→  0.7% / 1.9%
+        而且修后段数与「永不断开」完全一致，标点也没少 —— 不丢断句。
+        所以短句即使后面有明显停顿也不断开，继续往后合并，让模型自己在段内
+        按静音断句（它是听得到静音的）。
+        代价：短句不再因为停顿而"提前出字"，要攒够 3 秒才送（硬切
+        max_latency_s 仍是 3 秒，延迟封顶没变）。
         """
         if self._pending and gap >= self._split_gap_samples:
-            self._emit_pending()            # 先送走前面攒的，中间断开
+            pending_len = sum(len(p[0]) for p in self._pending)
+            if pending_len >= self.min_asr_samples:
+                self._emit_pending()        # 够长了，就在这里断开
         self._pending.append((np.asarray(samples, dtype=np.float32), gap))
         total = sum(len(p[0]) for p in self._pending)
 
