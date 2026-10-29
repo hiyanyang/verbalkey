@@ -310,13 +310,17 @@ def _dwm_round_corners(hwnd: int) -> bool:
 
 STATE = {
     "recording": ("录音中", "#FF2D55"),
+    # 上一轮的整段重解还占着识别锁，这一轮只能排队。
+    # 必须和「识别中」分开：识别中意味着正在出字，等待中意味着还没轮到，
+    # 混成一个标签时用户会以为说了没反应是识别坏了。
+    "waiting": ("等待中", "#8E8E93"),
     "recognizing": ("识别中", "#FF9500"),
     "polishing": ("整理中", "#AF52DE"),
     "done": ("已上屏", "#34C759"),
     "error": ("出错", "#FF3B30"),
 }
 
-ANIMATED = {"recording", "recognizing", "polishing"}
+ANIMATED = {"recording", "waiting", "recognizing", "polishing"}
 
 
 class PulseDot(QWidget):

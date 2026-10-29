@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.asr import AsrEngine  # noqa: E402
-from src.audio import Recorder, _trim_silence  # noqa: E402
+from src.audio import Recorder, _trim_silence, build_vad  # noqa: E402
 from src.config import (  # noqa: E402
     APP_NAME, APP_VERSION, CONFIG, LOGS_DIR, MODELS_DIR, VK_CONFIRM_NAME, VK_NAME,
 )
@@ -47,14 +47,43 @@ log = logging.getLogger("verbalkey")
 
 REPLACE_WINDOW_SEC = 45
 
-# 整段重解的安全上限（秒）。实测（不带热词、6 线程 CPU）：
+# 整段重解的长度上限（秒）。实测（不带热词、6 线程 CPU）：
 #   11.4s / 20.8s / 32.2s 都能完整解出（32.2s 得到 290 字，期望 292 字）
 #   43.6s 开始被截断（282 字 / 期望 433 字）
 #   79.7s 直接崩成一个幻觉 token「language」，一个字都不剩
-# 所以取 30 秒留余量，超过就退回分段结果（不比现状差）。
+# 所以 30 秒以内一次解完；超过 30 秒不再放弃重解，改成按静音分块解
+# （见 _split_long）—— 这是用户 2026-10-30 明确要求的：长口述也要终稿，
+# 但 30 秒以内那条路一个字都不许动。
+#
 # 注意：这个上限是 prompt + 音频共用 max_total_len(1024) 换来的，
 # 将来若重新给解码 prompt 塞热词，可用音频会变短，这里的值要跟着降。
 _MAX_REDECODE_SEC = 30.0
+
+# 分块重解的目标块长（秒）。取 16 秒是实测出来的，不是拍脑袋：
+# 同一段 51 秒音频、同一个模型，按不同块长硬切后逐块解码，总耗时
+#   8s → 24.0s   12s → 27.9s   16s → 23.9s   20s → 33.8s   28s → 43.3s
+# 解码耗时随音频长度**超线性**增长（5.25s 音频 0.51×实时、29s 0.67×、
+# 51s 0.94×），所以块越长越亏。16 秒这一档总耗时最低，又保住了比 VAD 段
+# （3 秒）长得多的上下文。
+# 切口不按固定位置切，优先落在 VAD 找出的真实停顿上（_find_pauses）：
+# 切在字中间的话，那个字两边各解一次，两边都认不出来 —— 正是分段丢字的
+# 老毛病。实测连续朗读（无停顿素材）切出来是「随他而 / 去追它而去」。
+_CHUNK_SEC = 16.0
+# 为了切在真停顿上，允许一块比目标长到这个上限。宁可多解 4 秒，也不要
+# 硬切在字中间 —— 硬切的代价是一个词被两边各解一次、谁都认不出来。
+# 26 秒仍远低于实测安全的 32.2 秒。
+_CHUNK_HARD_SEC = 26.0
+# 短于这个的"停顿"不算停顿。VAD 段的样本两端自带 padding，段与段之间
+# 会留下 0.08~0.15 秒的缝，那是 padding 缝不是换气，切在那里照样切断词。
+_MIN_PAUSE_SEC = 0.25
+# 每块最短多少秒。有个下限是为了不让一个紧贴块首的停顿把块切得太碎。
+_MIN_CHUNK_SEC = 6.0
+# 找不到真停顿时，往前回看的窗口：在「块尾前 3 秒」里找能量最低的一帧。
+_CHUNK_SEARCH_SEC = 3.0
+# 最多分几块。14 块 ≈ 224 秒有声；再长就放弃重解、退回分段草稿
+# （跟分块之前的处理一样）。不设上限的话，切块时间会无限长，
+# 而用户早就走神去做别的事了。
+_MAX_CHUNKS = 14
 
 
 # 停顿分档（秒）。依据是讯飞／百度实时 ASR 文档里那句「基于内容与停顿智能匹配
@@ -89,9 +118,11 @@ def _similar(a: str, b: str) -> float:
 def _voiced_sec(x: np.ndarray, sr: int) -> float:
     """算这段音频里「真有声音」的时长，跳过静音。
 
-    为什么不用总时长判 30 秒上限：整轮缓冲现在收的是麦克风全程音频，
-    段间停顿全在里面。用户中途想事情停 10 秒，总时长会顶过 30 秒，
-    但模型实际要解的语音只有 20 秒 —— 按总时长判就会白白放弃重解。
+    **只用于日志，不再参与任何判断**（2026-10-30 起）。分档改看总时长：
+    模型吃的是整段音频，静音一样占 max_total_len 的预算，所以「有声时长
+    短、静音长」的录音照样会超限 —— 拿有声时长当门槛，反而会放过这种。
+    留着它是为了在日志里区分「真说了 25 秒」和「说了 25 秒但中间想了 20 秒」，
+    排查重解为什么慢时要用。
     阈值与 audio._trim_silence 一致（20ms 帧、max(0.004, 峰值×0.08)），
     这样两边对「什么算有声」的判断不会打架。
     """
@@ -107,6 +138,209 @@ def _voiced_sec(x: np.ndarray, sr: int) -> float:
         return 0.0
     thr = max(0.004, peak * 0.08)
     return float(np.count_nonzero(rms > thr)) * frame / sr
+
+
+def _find_pauses(x: np.ndarray, sr: int) -> list[tuple[int, float]]:
+    """跑一遍干净的 VAD，找出这段音频里所有真实停顿。
+
+    返回 [(静音中点采样位置, 静音秒数)]，按位置升序，只给分块重解当切点。
+
+    为什么特意重跑一遍、而不是复用录音时那次 VAD 的结果：**录音过程中的
+    seg.start 不可信**。实测（fast1+0.7s停顿+rap1 共 61 秒素材）：
+    不 reset 时 start 是 160000/304896/471296…，单调递增、就是绝对位置；
+    一旦 vad.reset()，下一段的 start 立刻变成 17664、然后 6912、6400 ——
+    乱序且大幅回跳。而 audio._callback 每 3 秒有声就要强切一刀并 reset，
+    所以实时链路里攒出来的坐标全是错的。
+
+    这里新建一个 VAD，一次喂完，中途不 reset —— 坐标就是干净的绝对位置
+    （同一份实测里已验证单调），代价是 60 秒音频多花约 1 秒。
+    找不到静音（一口气念完、没换气）就返回空表，_split_long 会退回按能量切。
+    """
+    vad_model = MODELS_DIR / "silero_vad.onnx"
+    if not len(x) or not vad_model.exists():
+        return []
+    try:
+        vad = build_vad(str(vad_model), sr, dict(CONFIG.get("vad") or {}))
+    except Exception as e:
+        log.warning("找停顿失败，改按能量切：%s", e)
+        return []
+
+    out: list[tuple[int, float]] = []
+    last_end = -1
+
+    def drain():
+        nonlocal last_end
+        while not vad.empty():
+            seg = vad.front
+            s = int(getattr(seg, "start", -1))
+            if s >= 0:
+                if last_end >= 0 and s > last_end:
+                    gap = s - last_end
+                    # 切在静音正中间：两边各留半截停顿，块边界的音频最安全
+                    out.append((s - gap // 2, gap / sr))
+                last_end = s + len(seg.samples)
+            vad.pop()
+
+    blk = 512
+    try:
+        for i in range(0, len(x) - blk + 1, blk):
+            vad.accept_waveform(np.asarray(x[i:i + blk], dtype=np.float32))
+            drain()
+        vad.flush()
+        drain()
+    except Exception as e:
+        log.warning("找停顿出错，改按能量切：%s", e)
+        return []
+    return out
+
+
+def _looks_degenerate(text: str, min_repeat: int = 8) -> bool:
+    """识别结果退化成「复读机」时返回 True。
+
+    greedy_search 没有重复惩罚，遇到边界奇怪或高度重复的音频会卡在循环里
+    出不来。实测（2026-10-30，连续报数素材 fast1+rap1 拼 61 秒）：分块后
+    第 2 块把「大跃进」连念五十遍，509 字里 400 字是同一个词，而且这一块
+    解码花了 69 秒（正常应该 7 秒）。这种结果拿去替换草稿等于毁掉整段话。
+
+    判据：某个 2~8 字的片段**连续**重复 ≥8 遍。真实内容几乎不会这样
+    （「他还有二十个儿子，二十一个儿子…」每遍都不同，不会触发）。
+    """
+    t = (text or "").strip()
+    n = len(t)
+    if n < 40:
+        return False
+    for L in (2, 3, 4, 5, 6, 8):
+        i = 0
+        while i + L * min_repeat <= n:
+            unit = t[i:i + L]
+            k = 1
+            while t[i + k * L:i + (k + 1) * L] == unit:
+                k += 1
+            if k >= min_repeat:
+                return True
+            i += k * L if k > 1 else 1
+    return False
+
+
+def _split_long(x: np.ndarray, sr: int,
+                pauses: list[tuple[int, float]] | None = None,
+                max_sec: float = _CHUNK_SEC,
+                hard_sec: float = _CHUNK_HARD_SEC,
+                min_sec: float = _MIN_CHUNK_SEC,
+                min_pause: float = _MIN_PAUSE_SEC,
+                search_sec: float = _CHUNK_SEARCH_SEC,
+                ) -> list[tuple[np.ndarray, float]]:
+    """把超长音频切成若干块，返回 [(块, 切口处静音秒数), ...]。
+
+    只在整段音频超过 _MAX_REDECODE_SEC 时才会被调用（见 _redecode）；
+    30 秒以内的录音走原来那条一次解完的路，不进这里。
+
+    **切口必须落在静音上**，两条腿走路：
+      1. pauses 给了 VAD 找出来的真实停顿（_find_pauses）时，取「离目标块长
+         最近、且静音 ≥min_pause」的那一个，允许比目标长一点点（到 hard_sec）。
+         VAD 是按声学判的，它标出来的地方确实没人说话，切在那里最安全。
+         只认 ≥0.25 秒的停顿：VAD 段的样本两端自带 padding，段间会留下
+         0.08~0.15 秒的缝，那是 padding 缝不是换气，切在那里照样切断词
+         （实测按「取最靠后的停顿」就会选到 0.12 秒的缝上）。
+      2. 没有停顿可用（连续朗读、一口气念完），才退回按能量找：在块尾前
+         search_sec 秒里挑能量最低的一帧。这一档是**有损的**，可能切在词
+         中间 —— 实测连续朗读切出来是「随他而」+「去追它而去」（原句
+         「随它而去」被劈开）。但总比整段超过 30 秒直接放弃重解强，
+         日志里会写明用了哪种切法。
+
+    静音秒数要一起带出去：块与块之间的标点靠它决定，跟 _join_segments
+    用同一套阈值。不带的话每块结尾模型都会给个句号，拼起来满屏句号。
+    """
+    frame = max(1, int(sr * 0.02))
+    n = len(x) // frame
+    if n < 2:
+        return [(x, 0.0)]
+    rms = np.sqrt(np.mean(x[:n * frame].reshape(n, frame) ** 2, axis=1))
+    peak = float(rms.max())
+    if peak < 0.004:
+        return [(x, 0.0)]
+    # 阈值与 audio._trim_silence 一致，两边对「什么算静音」的判断不会打架
+    thr = max(0.004, peak * 0.08)
+    max_frames = max(1, int(max_sec / 0.02))
+    hard_frames = max(1, int(hard_sec / 0.02))
+    min_frames = max(1, int(min_sec / 0.02))
+    look = max(1, int(search_sec / 0.02))
+
+    # 停顿点换成帧下标
+    marks: list[tuple[int, float]] = []
+    for pos, gap in (pauses or []):
+        f = int(pos // frame)
+        if 0 < f < n:
+            marks.append((f, gap))
+    marks.sort()
+
+    out: list[tuple[np.ndarray, float]] = []
+    start = 0
+    # 剩下的还超过硬上限才需要再切一刀；不到就整段留给最后一块
+    while n - start > hard_frames:
+        limit = start + max_frames
+        pick: tuple[int, float] | None = None
+        # 1) 真停顿优先：在「目标块长 ±」范围内挑**离目标最近**的真停顿。
+        # 只挑离目标近的，不挑最靠后的 —— 实测按「最靠后」会选到 0.12 秒的
+        # padding 缝，那等于没切在停顿上。
+        best: tuple[int, int, float] | None = None
+        for f, g in marks:
+            if f < start + min_frames or f > start + hard_frames:
+                continue
+            if g < min_pause:
+                continue
+            d = abs(f - limit)
+            if best is None or d < best[0]:
+                best = (d, f, g)
+        if best is not None:
+            pick = (best[1], best[2])
+        if pick is None:
+            # 2) 退回能量最低点
+            lo = max(start + min_frames, limit - look)
+            i = lo + int(np.argmin(rms[lo:limit]))
+            gap_sec = 0.0
+            if rms[i] <= thr:
+                a = i
+                while a > start and rms[a - 1] <= thr:
+                    a -= 1
+                b = i
+                while b + 1 < n and rms[b + 1] <= thr:
+                    b += 1
+                gap_sec = (b - a + 1) * frame / sr
+            pick = (i, gap_sec)
+        out.append((x[start * frame:pick[0] * frame], pick[1]))
+        start = pick[0]
+    out.append((x[start * frame:], 0.0))
+    return out
+
+
+def _join_chunks(parts: list[tuple[str, float]]) -> str:
+    """把各块的识别结果拼回一段，块间标点由切口处的静音长度决定。
+
+    规则与 _join_segments 一致：中间块结尾模型给的标点全部丢掉（它看不到
+    后文，句号没有语义依据），按停顿补一个句号或逗号；最后一块的结尾
+    问号/感叹号可信，留着。
+
+    停顿挂在**切口前那一块**身上（_split_long 的返回值就是这样配的），
+    所以分隔第 i 块用的是第 i-1 块的 gap —— 不是自己那份。
+    """
+    clean = [(t.strip(), g or 0.0) for t, g in parts if t and t.strip()]
+    if not clean:
+        return ""
+    out: list[str] = []
+    last_i = len(clean) - 1
+    for i, (t, _gap) in enumerate(clean):
+        if i == last_i:
+            t = t.rstrip("。．.，,、；;：:")
+        else:
+            t = t.rstrip("。．.！!？?，,、；;：:")
+        if not t:
+            continue
+        if not out:
+            out.append(t)
+            continue
+        out.append(("。" if clean[i - 1][1] >= _GAP_STOP else "，") + t)
+    return "".join(out)
 
 
 def _join_segments(parts: list[tuple[str, int]]) -> str:
@@ -178,6 +412,7 @@ class Bridge(QObject):
     segment = Signal(str, int)   # 文本, 距离上一段的静音采样数
     finished = Signal()
     state = Signal(str)
+    hint = Signal(str)                 # 浮窗副标题，工作线程用来报进度/等多久
     polished = Signal(str, str, int)   # 文本, 错误信息, 请求序号
     error = Signal(str)
     asr_ready = Signal()               # 识别模型加载完成
@@ -213,6 +448,13 @@ class App:
         self._polish_seq = 0
         self._polish_ctx = None          # (序号, 是否直出, 原文)
         self.busy = False
+        # 上一轮的整段重解正在跑（占着识别锁）。用户这时按热键，说的话只能
+        # 排队等锁，浮窗必须如实显示「等待中」，不能显示「识别中」——
+        # 那会让人以为识别坏了，或者以为还能接着说。
+        self.redecoding = False
+        # 本热键轮已经松开。busy 要等队列排空、_on_finish 才清，这中间
+        # 光看 busy 分不清「还在按着」和「已经松手在等识别」。
+        self._released = False
         self.target_hwnd = 0             # 按下热键时的前台窗口，上屏前要把焦点还给它
         # 本次录音的最大峰值，用来判断麦克风音量是不是低到影响识别
         self._last_peak = 0.0
@@ -237,6 +479,7 @@ class App:
         b.segment.connect(self._on_segment_ui)
         b.finished.connect(self._on_finish)
         b.state.connect(lambda s: self.hud.set_state(s))
+        b.hint.connect(lambda t: self.hud.set_hint(t))
         b.polished.connect(self._on_polished)
         b.error.connect(lambda m: (log.error(m), self.hud.flash("error", m, 3000)))
         b.asr_ready.connect(self._on_asr_ready)
@@ -473,17 +716,31 @@ class App:
         # 记住按热键时焦点在哪个窗口，上屏前要把焦点还回去
         self.target_hwnd = get_foreground()
         self.busy = True
+        self._released = False
         self._prewarm_polish()
         self._make_recorder()
         if not self.recorder or not self.recorder.start():
             self.busy = False
+            return
+        if self.redecoding:
+            # 上一轮的整段重解还占着识别锁。录音照样开始（麦克风全程缓冲，
+            # 声音一点不会丢），但不能显示「录音中」就完事 —— 用户会以为
+            # 文字马上出来，实际要等重解跑完才轮得到这一轮。
+            self.hud.show_hud("waiting", "")
+            self.hud.set_hint("上一段还在重解，请稍等。你现在说的话会录下来，不会丢")
             return
         self.hud.show_hud("recording", "")
 
     def _stop(self):
         if not self.busy or not self.recorder:
             return
+        self._released = True
         self.recorder.stop()
+        if self.redecoding:
+            # 别显示「识别中」：这一句还在排队，一个字都还没开始解
+            self.hud.set_state("waiting")
+            self.hud.set_hint("上一段还在重解，排队等它跑完再识别这一句…")
+            return
         self.hud.set_state("recognizing")
 
     def _on_press(self):
@@ -537,7 +794,18 @@ class App:
                 peak = float(abs(samples).max())
                 if peak > self._last_peak:
                     self._last_peak = peak
+            # 识别锁被上一轮的整段重解占着，transcribe 会在这儿阻塞几秒甚至
+            # 十几秒（分块重解）。阻塞前先说清楚：这不是在识别，是在排队。
+            waited = self.redecoding
+            if waited:
+                self.bridge.state.emit("waiting")
+                self.bridge.hint.emit("上一段还在重解，排队等它跑完再识别这一句…")
             text = self.asr.transcribe(samples, int(CONFIG.get("audio", "sample_rate")))
+            if waited and not self.redecoding:
+                # 锁放开了，这一句才开始解。把「等待中」换回真实状态，
+                # 否则用户会以为还卡着。
+                self.bridge.hint.emit("")
+                self.bridge.state.emit("recognizing" if self._released else "recording")
             log.info("识别 %.1fs 音频，峰值 %.3f，耗时 %.2fs%s%s",
                      len(samples) / 16000, self._last_peak, time.time() - t0,
                      "（硬切）" if forced else "",
@@ -596,6 +864,12 @@ class App:
         # 取走整轮音频。必须在下一轮 start() 之前取 —— 那边会清空。
         # 分段结果是「草稿」，整段重解才是「终稿」，两者差在上下文是否完整。
         utterance = self.recorder.take_utterance() if self.recorder else None
+        if utterance is not None and self.recorder and self.recorder.utterance_truncated:
+            # 全程缓冲有上限（Recorder.ALL_MAX_SEC）。超了就是音频不完整，
+            # 拿它重解只会丢掉后半段 —— 而草稿里有全文，替换过来等于砍掉一截。
+            log.warning("本轮录音超过 %.0fs，全程缓冲已截断，跳过整段重解",
+                        Recorder.ALL_MAX_SEC)
+            utterance = None
         if utterance is not None:
             log.info("本轮音频共 %.1fs，进入整段重解", len(utterance) / _SR)
         if not raw:
@@ -701,6 +975,13 @@ class App:
         按住时出草稿，松开后整段重解出终稿。
 
         失败、超长、或用户已经在说下一段，一律退回草稿 —— 绝不让它比现在更差。
+
+        长度分两档（用户 2026-10-30 定的口径）：
+          ≤ 30 秒：一次解完，跟以前一模一样，一个字符都不动。
+          > 30 秒：按停顿分块（目标 16 秒一块，为凑停顿最多 26 秒）逐块解，
+                   再拼回去。以前这一档是直接放弃重解、退回分段草稿
+                   （分段草稿仍会丢边界字），所以这是净增益 —— 代价是耗时
+                   翻几倍，见 _decode_chunks。
         """
         sr = int(CONFIG.get("audio", "sample_rate"))
         # 整轮缓冲存的是**全程音频**：麦克风收到的每一块，不等 VAD 判断。
@@ -713,25 +994,46 @@ class App:
         if len(clean) < len(utterance):
             log.info("整段重解前削掉首尾静音 %.2fs → %.2fs",
                      len(utterance) / sr, len(clean) / sr)
-        # 上限按**有声时长**判（见 _voiced_sec）：整轮缓冲含段间全部停顿，
-        # 按总时长判会让「中途想过事情」的录音白白放弃重解。
-        secs = _voiced_sec(clean, sr)
+        if not len(clean):
+            return draft              # 整段都是底噪，没什么可解的
+        secs = _voiced_sec(clean, sr)          # 只用于日志，判断走总时长
         total = len(clean) / max(sr, 1)
-        if secs > _MAX_REDECODE_SEC:
-            log.info("跳过整段重解：有声 %.1fs（总长 %.1fs）超过 %.0fs 上限",
-                     secs, total, _MAX_REDECODE_SEC)
-            return draft
         if self.busy:
             log.info("跳过整段重解：已经在录下一段")
             return draft
-        if not len(clean):
-            return draft              # 整段都是底噪，没什么可解的
+        # 分档只看**总时长**。有声时长一定小于等于总时长，所以「有声 >30s」
+        # 必然也「总长 >30s」，用总时长一个条件就能覆盖两边，而且它才是
+        # 模型真正吃进去的长度 —— 43.6 秒那段被截断，静音一样占 token。
+        chunks = None
+        if total > _MAX_REDECODE_SEC:
+            # 在**削过首尾静音之后**的音频上重新找停顿：坐标天然对齐，
+            # 不用担心下标平移；而且这个 VAD 中途不 reset，位置可信。
+            pauses = _find_pauses(clean, sr)
+            chunks = _split_long(clean, sr, pauses)
+            if len(chunks) > _MAX_CHUNKS:
+                log.info("跳过整段重解：总长 %.1fs 要分 %d 块，超过 %d 块上限",
+                         total, len(chunks), _MAX_CHUNKS)
+                return draft
+            log.info("整段重解改分块：有声 %.1fs / 总长 %.1fs → %d 块"
+                     "（每块 ≤%.0fs，VAD 找到停顿 %d 处）",
+                     secs, total, len(chunks), _CHUNK_SEC, len(pauses))
         t0 = time.time()
+        # 重解期间识别锁一直被占着，用户这时按热键说的话只能排队。
+        # 主线程靠这个标记把浮窗从「识别中」改成「等待中」，见 _stop/_decode_segment。
+        self.redecoding = True
         try:
-            text = self.asr.transcribe(clean, sr)
+            if chunks is None:
+                text = self.asr.transcribe(clean, sr)
+            else:
+                parts = self._decode_chunks(chunks, sr)
+                if parts is None:
+                    return draft          # 中途用户开口了，拼不全的结果不能用
+                text = _join_chunks(parts)
         except Exception as e:
             log.warning("整段重解失败，沿用分段结果：%s", e)
             return draft
+        finally:
+            self.redecoding = False
         dt = time.time() - t0
         if not text:
             log.info("整段重解没有结果（%.2fs），沿用分段结果", dt)
@@ -743,9 +1045,46 @@ class App:
             text = hotwords.apply_corrections(text)
         except Exception as e:
             log.warning("应用纠正表失败（忽略）：%s", e)
-        log.info("整段重解 %.1fs 有声（总长 %.1fs），耗时 %.2fs：分段 %d 字 → 整段 %d 字",
-                 secs, total, dt, len(draft), len(text))
+        log.info("整段重解 %.1fs 有声（总长 %.1fs，%s），耗时 %.2fs："
+                 "分段 %d 字 → 整段 %d 字",
+                 secs, total, ("分 %d 块" % len(chunks)) if chunks else "整段一次",
+                 dt, len(draft), len(text))
         return text
+
+    def _decode_chunks(self, chunks: list, sr: int) -> list | None:
+        """逐块解码超长录音。返回 [(文本, 切口静音秒数)]，中止时返回 None。
+
+        两块之间的中止检查不是多余的：分块重解要占识别锁 10 秒以上，用户
+        这时候多半已经开口说下一句了。继续解完剩下的块没有意义 —— 拼出来
+        的是半截话，拿它去替换草稿反而更糟（见 _apply_redecode 的闸门），
+        而且会一直堵着新一轮的识别。所以一旦发现新一轮已经开始，立刻收手，
+        退回分段草稿。
+        """
+        n = len(chunks)
+        parts: list[tuple[str, float]] = []
+        for i, (buf, gap) in enumerate(chunks, 1):
+            if self.busy:
+                log.info("分块重解中止：用户已在说下一段（已解 %d/%d 块）", i - 1, n)
+                self.bridge.hint.emit("")
+                return None
+            if not len(buf):
+                continue
+            if n > 1:
+                # 分块时等待变长，必须让浮窗说清进度，否则用户以为卡死了
+                self.bridge.hint.emit(f"整段重解中… 第 {i}/{n} 块")
+            t = self.asr.transcribe(buf, sr)
+            parts.append((t, gap))
+            log.info("重解第 %d/%d 块：%.1fs 音频 → %d 字",
+                     i, n, len(buf) / max(sr, 1), len(t or ""))
+            if _looks_degenerate(t):
+                # 复读结果不能要：宁可整段退回草稿，也不能把一整段话换成一串重复词
+                log.warning("第 %d/%d 块解成复读（%d 字），放弃本次重解，沿用草稿",
+                            i, n, len(t or ""))
+                self.bridge.hint.emit("")
+                return None
+        if n > 1:
+            self.bridge.hint.emit("")
+        return parts
 
     def _polish_async(self, text: str, level: int, seq: int, utterance=None):
         self.bridge.state.emit("polishing")
@@ -1149,10 +1488,10 @@ def main():
     app = App(qt)
     # 启动标记：每次部署完先看这一行，确认跑的是哪一版、哪个行为开关生效。
     # 没有这行就只能靠猜（曾经把「应该已经生效」当成结论报给用户）。
-    log.info("启动标记 BUILD=2026-10-30-r13 版本=%s 整段重解上限=%.0fs "
-             "粘贴模式=%s 整理级别=%s 自动替换=%s",
+    log.info("启动标记 BUILD=2026-10-30-r14 版本=%s 整段重解上限=%.0fs "
+             "分块上限=%.0fs×%d 粘贴模式=%s 整理级别=%s 自动替换=%s",
              APP_VERSION,
-             _MAX_REDECODE_SEC,
+             _MAX_REDECODE_SEC, _CHUNK_SEC, _MAX_CHUNKS,
              CONFIG.get("polish", "paste_mode"),
              CONFIG.get("polish", "level"),
              CONFIG.get("polish", "auto_replace"))

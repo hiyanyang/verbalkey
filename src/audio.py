@@ -83,7 +83,8 @@ class Recorder:
     PREROLL_SEC = 0.80    # 按键前的预缓冲（0.4 秒救不回「先开口再按键」的半个词）
     TAIL_SEC = 0.50       # 松键后继续收多久：尾音拖得比想象中长，0.35 仍会吃掉半个字
     MIN_TAIL_SEC = 0.30   # 尾音收尾的基准时长，_flush_pending 取它的 1/5 来挡碎片
-    ALL_MAX_SEC = 300     # 全程缓冲上限。超过 30s 本来就不重解，这只是防异常占内存
+    ALL_MAX_SEC = 300     # 全程缓冲上限（秒）。分块重解最多 14 块 ×16s ≈ 224s，
+                          # 300 秒够用；再长就只是防异常占内存
 
     def __init__(self, vad_model: str, sample_rate: int, vad_cfg: dict,
                  device=None, on_segment: Callable[[np.ndarray], None] = None,
@@ -144,6 +145,12 @@ class Recorder:
         self._all_buf: list[np.ndarray] = []
         self._all_len = 0
         self._all_max = int(self.ALL_MAX_SEC * sample_rate)
+        self._all_truncated = False
+        # 注意：这里**不**记录 VAD 的停顿坐标。seg.start 在 vad.reset() 之后
+        # 会跳回很小的值（实测 160000 → 17664 → 6912 → 6400，非单调），
+        # 而 _callback 每 3 秒有声就要 reset 一次，所以录音过程中拿到的
+        # 位置一律不可信。分块重解需要切口坐标，改成事后再跑一遍干净的 VAD
+        # （见 main._find_pauses）。
         self._utt_lock = threading.Lock()
 
     def _emit_error(self, msg: str):
@@ -214,9 +221,20 @@ class Recorder:
             return
         with self._utt_lock:
             if self._all_len >= self._all_max:
+                self._all_truncated = True
                 return                      # 异常长的录音，不再往里堆
             self._all_buf.append(samples.copy())
             self._all_len += len(samples)
+
+    @property
+    def utterance_truncated(self) -> bool:
+        """这一轮的全程音频是否被 ALL_MAX_SEC 截断过。
+
+        截断意味着 take_utterance() 拿到的不是完整录音：拿它重解只会丢掉
+        后半段，而分段草稿里有全文 —— 替换过去等于砍掉一截。调用方（main）
+        见到 True 就跳过整段重解。
+        """
+        return self._all_truncated
 
     def take_utterance(self) -> np.ndarray | None:
         """取走这一轮录音的全程音频，取完即清空。
@@ -396,6 +414,7 @@ class Recorder:
             with self._utt_lock:
                 self._all_buf = []
                 self._all_len = 0
+                self._all_truncated = False
             # 新一轮从零开始算静音间隔。中途 vad.reset() 不清，那之后是
             # 「一口气继续往下说」，本来就该按无停顿处理
             self._last_end = 0
