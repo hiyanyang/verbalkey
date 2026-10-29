@@ -78,9 +78,11 @@ OPTIONS = [
     {
         "groups": ["pinyin"],
         "title": "拼音输入法（可选）",
-        "desc": "小狼毫引擎 + 雾凇拼音，打字和语音共用一个中/英图标。装的时候要授权一次",
+        "desc": "小狼毫引擎 + 雾凇拼音，打字和语音共用一个中/英图标。"
+                "会自动下载并装好，装引擎那一步系统会要一次授权",
         "required": False,
         "checked": False,
+        "install": True,     # 除了下载，还要跑安装流程（rime_setup.setup_all）
     },
 ]
 
@@ -89,16 +91,27 @@ def _missing_items(groups: list[str]) -> list[dict]:
     return [a for a in F.select(groups) if F.status(a) != "ok"]
 
 
+def pinyin_installed() -> bool:
+    """拼音**装没装**（不是文件在不在）。"""
+    try:
+        from .. import rime_setup
+        return bool(rime_setup.status()["installed"])
+    except Exception:
+        return False
+
+
 class _Worker(QThread):
     """下载在子线程跑，界面只接收信号 —— 否则进度条根本不刷新。"""
 
     log = Signal(str)
     progress = Signal(int, int, float)   # 已下, 总数, 速度
-    done = Signal(list)                  # 失败项
+    phase = Signal(str)                  # 进入安装阶段（此时没有进度可言）
+    done = Signal(list, str)             # 失败项, 附加说明（拼音装失败时的原因）
 
-    def __init__(self, items: list[dict]):
+    def __init__(self, items: list[dict], pinyin: bool = False):
         super().__init__()
         self.items = items
+        self.pinyin = pinyin
         self._stop = False
 
     def cancel(self) -> None:
@@ -111,7 +124,26 @@ class _Worker(QThread):
             on_progress=lambda d, t, s: self.progress.emit(d, t, s),
             stop=lambda: self._stop,
         )
-        self.done.emit(failed)
+        note = ""
+        # 拼音不是「下完就能用」：还要装引擎、注册、铺词库、编译。
+        # 这些以前留在设置页让用户自己点，等于白下。现在这里一次做完。
+        # setup_all 内部会自己补齐拼音文件（ensure_bundle），所以上面
+        # 的 items 里故意不含 pinyin 组，避免同一批文件下两遍。
+        if not failed and self.pinyin and not self._stop:
+            self.phase.emit("正在安装拼音输入法…（会弹一次系统授权框，点「是」）")
+            try:
+                from .. import rime_setup
+                ok, msg = rime_setup.setup_all(
+                    on_log=self.log.emit,
+                    on_progress=lambda d, t, s: self.progress.emit(d, t, s),
+                    stop=lambda: self._stop,
+                )
+            except Exception as e:
+                ok, msg = False, f"安装拼音输入法出错：{e}"
+            self.log.emit(msg)
+            if not ok:
+                note = msg
+        self.done.emit(failed, note)
 
 
 class FirstRunDialog(QDialog):
@@ -157,12 +189,20 @@ class FirstRunDialog(QDialog):
         for opt in OPTIONS:
             items = _missing_items(opt["groups"])
             mb = F.estimate_mb(items)
+            # 拼音的「还需要做点什么」不一定等于「还有文件要下」：文件下完了
+            # 但引擎没装，用户还是用不了，这一行必须还能勾、还能点。
+            need = mb > 0 or (bool(opt.get("install")) and not pinyin_installed())
             row = QHBoxLayout()
             cb = QCheckBox(opt["title"])
-            cb.setChecked(bool(opt["checked"]) and mb > 0)
-            cb.setEnabled(not opt["required"] and mb > 0)
+            # 拼音有个特殊情况：文件已经下过（用户上次选过它）、但引擎没装完。
+            # 这时候不能按「默认不勾」处理 —— 用户已经表达过意图，而且窗口
+            # 会显示「待安装」却默认不勾，点「开始使用」就直接跳过，
+            # 表现就是「明明下过却一直用不了拼音」。所以这种情况默认勾上。
+            half_done = bool(opt.get("install")) and need and mb <= 0
+            cb.setChecked((bool(opt["checked"]) and need) or half_done)
+            cb.setEnabled(not opt["required"] and need)
             cb.stateChanged.connect(lambda _=0: self._refresh_sum())
-            right = QLabel("已就绪" if mb <= 0 else f"{mb:,.0f} MB")
+            right = QLabel(self._row_text(opt, mb))
             right.setObjectName("sub")
             right.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             right.setMinimumWidth(90)
@@ -216,6 +256,23 @@ class FirstRunDialog(QDialog):
 
     # ---------- 逻辑 ----------
 
+    @staticmethod
+    def _row_text(opt: dict, mb: float) -> str:
+        if mb > 0:
+            return f"{mb:,.0f} MB"
+        # 拼音：文件齐了 ≠ 能用了，引擎没装还得装
+        if opt.get("install") and not pinyin_installed():
+            return "待安装"
+        return "已就绪"
+
+    def _refresh_rows(self) -> None:
+        """下载结束后把每行的「体积 / 待安装 / 已就绪」重新算一遍。"""
+        for opt, cb, right in self._rows:
+            mb = F.estimate_mb(_missing_items(opt["groups"]))
+            right.setText(self._row_text(opt, mb))
+            need = mb > 0 or (bool(opt.get("install")) and not pinyin_installed())
+            cb.setEnabled(not opt["required"] and need)
+
     def _selected_groups(self) -> list[str]:
         out: list[str] = []
         for opt, cb, _ in self._rows:
@@ -223,11 +280,18 @@ class FirstRunDialog(QDialog):
                 out.extend(opt["groups"])
         return out
 
+    def _wants_pinyin(self) -> bool:
+        for opt, cb, _ in self._rows:
+            if opt.get("install"):
+                return cb.isChecked()
+        return False
+
     def _selected_items(self) -> list[dict]:
+        """要下的文件（不含拼音组 —— 它由 setup_all 连带下载，见 _Worker.run）。"""
         items: list[dict] = []
         seen = set()
         for opt, cb, _ in self._rows:
-            if not cb.isChecked():
+            if not cb.isChecked() or opt.get("install"):
                 continue
             for a in _missing_items(opt["groups"]):
                 key = str(a["dest"])
@@ -239,29 +303,38 @@ class FirstRunDialog(QDialog):
     def _refresh_sum(self) -> None:
         items = self._selected_items()
         mb = F.estimate_mb(items)
-        if mb <= 0:
+        py = self._wants_pinyin() and not pinyin_installed()
+        tail = "，再装拼音输入法" if py else ""
+        if mb <= 0 and not py:
             self.lbl_sum.setText("都装好了，不用下任何东西")
             self.btn_go.setText("开始使用")
             self.btn_go.setEnabled(True)
+        elif mb <= 0:
+            self.lbl_sum.setText("拼音输入法还没装，点下面的按钮装一下")
+            self.btn_go.setText("开始安装")
+            self.btn_go.setEnabled(True)
         elif mb >= 1024:
             self.lbl_sum.setText(f"需要下载 {len(items)} 个文件，"
-                                 f"合计约 {mb/1024:.2f} GB")
+                                 f"合计约 {mb/1024:.2f} GB{tail}")
         elif mb >= 1:
             self.lbl_sum.setText(f"需要下载 {len(items)} 个文件，"
-                                 f"合计约 {mb:,.0f} MB")
+                                 f"合计约 {mb:,.0f} MB{tail}")
         else:
-            self.lbl_sum.setText(f"需要下载 {len(items)} 个文件，合计不到 1 MB")
+            self.lbl_sum.setText(f"需要下载 {len(items)} 个文件，合计不到 1 MB{tail}")
+        if py:
+            self.btn_go.setText("开始下载并安装")
 
     def _on_go(self) -> None:
         items = self._selected_items()
-        if not items:
+        py = self._wants_pinyin() and not pinyin_installed()
+        if not items and not py:
             self.accept()
             return
         for _, cb, _ in self._rows:
             cb.setEnabled(False)
         self.btn_later.setEnabled(False)
         self.btn_go.setEnabled(False)
-        self.btn_go.setText("正在下载…")
+        self.btn_go.setText("正在下载…" if items else "正在安装…")
         self.bar.setVisible(True)
         self.lbl_state.setVisible(True)
         self.log.setVisible(True)
@@ -270,11 +343,17 @@ class FirstRunDialog(QDialog):
         self.log.clear()
         self._total_mb = F.estimate_mb(items)
 
-        self.worker = _Worker(items)
+        self.worker = _Worker(items, py)
         self.worker.log.connect(self.log.appendPlainText)
         self.worker.progress.connect(self._on_progress)
+        self.worker.phase.connect(self._on_phase)
         self.worker.done.connect(self._on_done)
         self.worker.start()
+
+    def _on_phase(self, text: str) -> None:
+        """进入安装阶段：没有百分比可言，进度条转圈，文字说清在干什么。"""
+        self.bar.setRange(0, 0)
+        self.lbl_state.setText(text)
 
     def _on_progress(self, done: int, total: int, speed: float) -> None:
         if total > 0:
@@ -290,8 +369,9 @@ class FirstRunDialog(QDialog):
             self.lbl_state.setText(
                 f"已下载 {done/1048576:.0f} MB　{F.human(speed)}/s")
 
-    def _on_done(self, failed: list) -> None:
+    def _on_done(self, failed: list, note: str = "") -> None:
         self.worker = None
+        self._refresh_rows()
         if failed:
             self.bar.setRange(0, 100)
             self.bar.setValue(0)
@@ -312,9 +392,29 @@ class FirstRunDialog(QDialog):
             self.btn_go.clicked.connect(self._on_go)
             return
 
+        if note:
+            # 文件都在，栽在安装这一步（多半是 UAC 被关了或者编译失败）
+            self.bar.setRange(0, 100)
+            self.bar.setValue(0)
+            self.lbl_state.setText(f"拼音输入法没装成：{note}")
+            self.btn_go.setText("再试一次")
+            self.btn_go.setEnabled(True)
+            self.btn_later.setEnabled(True)
+            self.btn_later.setText("先不用拼音")
+            try:
+                self.btn_go.clicked.disconnect()
+            except Exception:
+                pass
+            self.btn_go.clicked.connect(self._on_go)
+            return
+
         self.bar.setRange(0, 100)
         self.bar.setValue(100)
-        self.lbl_state.setText("全部完成，现在可以用了")
+        done_py = pinyin_installed()
+        self.lbl_state.setText(
+            "全部完成，现在可以用了。"
+            "按 Win+空格 切到 Verbalkey 就能打拼音" if done_py
+            else "全部完成，现在可以用了")
         self.btn_go.setText("开始使用")
         self.btn_go.setEnabled(True)
         self.btn_later.setVisible(False)

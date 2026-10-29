@@ -326,6 +326,16 @@ class App:
             log.exception("引导窗口创建失败")
             self.hud.flash("error", "下载引导打不开，看 logs/app.log", 4000)
             return
+        # 引导窗口必须压在最上层。用户双击 exe 时前台常常还是浏览器或资源管理器，
+        # 窗口老老实实开在别人后面 —— 用户看到的就是「双击没反应」，然后就没有然后了。
+        # README 里那条「双击没反应」的排查项，有一半是这么来的。
+        try:
+            dlg.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+            dlg.show()
+            dlg.raise_()
+            dlg.activateWindow()
+        except Exception:
+            log.exception("引导窗口置前失败（不影响下载）")
         log.info("下载引导已打开")
         ok = dlg.exec() == QDialog.Accepted
         if ok:
@@ -1090,7 +1100,7 @@ def main():
     app = App(qt)
     # 启动标记：每次部署完先看这一行，确认跑的是哪一版、哪个行为开关生效。
     # 没有这行就只能靠猜（曾经把「应该已经生效」当成结论报给用户）。
-    log.info("启动标记 BUILD=2026-10-30-r11 版本=%s 整段重解上限=%.0fs "
+    log.info("启动标记 BUILD=2026-10-30-r12 版本=%s 整段重解上限=%.0fs "
              "粘贴模式=%s 整理级别=%s 自动替换=%s",
              APP_VERSION,
              _MAX_REDECODE_SEC,
