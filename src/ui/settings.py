@@ -1041,7 +1041,7 @@ class SettingsWindow(QMainWindow):
             "全程离线，录音不离开本机。")
         self._put(lay, c)
 
-        foot = QLabel("开发者：@闫阳")
+        foot = QLabel("开发者：heyyorkyan@gmail.com")
         foot.setAlignment(Qt.AlignCenter)
         foot.setStyleSheet(f"color:{MUTED}; font-size:13px; border:none;")
         lay.insertWidget(lay.count() - 1, foot)
