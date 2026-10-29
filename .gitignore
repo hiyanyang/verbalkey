@@ -1,0 +1,34 @@
+# ---- 模型权重（3.1 GB）----
+# 按 README「模型下载」自行放到 models/，不进仓库：
+#   GitHub 单文件上限 100 MB，光 ASR 模型就 954 MB，必被拒
+/models/
+
+# ---- 构建产物（每次打包几十上百 MB，且含旧代码）----
+/build/
+/build2/
+/build_icon/
+/build_icon_work/
+/dist/
+/dist2/
+
+# ---- 第三方二进制：llama.cpp、小狼毫引擎与雾凇词库 ----
+# 体积大，且各自带自己的许可证，不适合塞进本仓库再分发
+/bin/
+/assets/rime/
+
+# ---- 本机数据 ----
+# config.json 里有本机绝对路径；data/ 是成对语料（含说过的原话）；
+# logs/ 里有每一次上屏的全文。这三样都属于隐私，不进公开仓库。
+/config.json
+/data/
+/logs/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ---- 系统 ----
+Thumbs.db
+desktop.ini
