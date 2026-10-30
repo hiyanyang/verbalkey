@@ -11,6 +11,8 @@ from pathlib import Path
 import numpy as np
 import sherpa_onnx
 
+from src import halluc
+
 log = logging.getLogger(__name__)
 
 # 连续出现这么多个热词，就判定成「把词表念出来了」而不是真在说话。
@@ -274,7 +276,11 @@ class AsrEngine:
             stream = self.recognizer.create_stream()
             stream.accept_waveform(sample_rate, x)
             self.recognizer.decode_stream(stream)
-            return (stream.result.text or "").strip()
+            # 控制符在这里就清掉：`<|endoftext|>` 是模型的「我说完了」标记，
+            # 它后面的一切都是模型自说自话（2026-10-31 草稿里那段「人权观察」
+            # 就是这么来的）。人话里不可能出现这种符号，删它零误伤，
+            # 而且所有出口（草稿、终稿、剪贴板）都过这里，一处清全部干净。
+            return halluc.scrub((stream.result.text or "").strip())
 
     def transcribe_batch(self, chunks: list, sample_rate: int = 16000) -> list[str]:
         """多段一起解码。保留供离线批处理用；实时链路实测并行并不比串行快

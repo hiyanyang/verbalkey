@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.asr import AsrEngine  # noqa: E402
 from src.audio import Recorder, _trim_silence, build_vad  # noqa: E402
+from src import halluc, native_log  # noqa: E402
 from src.config import (  # noqa: E402
     APP_NAME, APP_VERSION, CONFIG, LOGS_DIR, MODELS_DIR, VK_CONFIRM_NAME, VK_NAME,
 )
@@ -44,6 +45,11 @@ _log_handler.setFormatter(
     logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 logging.basicConfig(level=logging.INFO, handlers=[_log_handler])
 log = logging.getLogger("verbalkey")
+
+# 接管 C++ 层的 stderr（sherpa-onnx / onnxruntime 的诊断）。
+# 必须在识别模型加载之前装好，否则首次加载阶段的输出抓不到。
+# 失败也没关系：install() 自己会退化成「不捕获」，不影响主流程。
+native_log.install(LOGS_DIR)
 
 REPLACE_WINDOW_SEC = 45
 
@@ -409,7 +415,7 @@ class Bridge(QObject):
 
     pressed = Signal()
     released = Signal()
-    segment = Signal(str, int)   # 文本, 距离上一段的静音采样数
+    segment = Signal(str, int, bool)   # 文本, 距离上一段的静音采样数, 是否可信
     finished = Signal()
     state = Signal(str)
     hint = Signal(str)                 # 浮窗副标题，工作线程用来报进度/等多久
@@ -432,6 +438,16 @@ class App:
         self.settings = None
 
         self.buffer: list[tuple[str, int]] = []   # (识别文本, 前置停顿采样数)
+        # 与 buffer 一一对应的「可不可信」标记。不可信的段照样进 buffer
+        # （终稿重解要拿它当基准比对），只是不往浮窗上显示。
+        self._trust: list[bool] = []
+        # 浮窗上真正显示的那几段。不可信的段落填空串，所以它的长度总是
+        # 和 buffer 一样，眼睛看到的旧内容不会被后面的段覆盖。
+        self._disp: list[str] = []
+        # 本轮到目前为止有没有解出过中文。用来启用「整段不是中文」这条判据：
+        # 只有前面说的是中文时，突然冒出一整段英文才可疑；用户整场讲英文
+        # 就不会触发。
+        self._saw_cjk = False
         self.last_pasted = ""            # 最近一次真正写进光标的内容
         # (整理版, 过期时间, 上屏序号)。序号是这次整理「对应哪一次上屏」的唯一凭据
         self.pending_replace = None
@@ -719,6 +735,9 @@ class App:
             self.hud.flash("error", "识别模型还在加载，稍等一下", 2500)
             return
         self.buffer = []
+        self._trust = []
+        self._disp = []
+        self._saw_cjk = False
         self.pending_replace = None
         self._last_peak = 0.0
         # 记住按热键时焦点在哪个窗口，上屏前要把焦点还回去
@@ -836,15 +855,45 @@ class App:
                      "（硬切）" if forced else "",
                      f"，前置停顿 {gap / 16000:.2f}s" if gap and gap > 0 else "")
             if text:
-                self.bridge.segment.emit(text, gap)
+                # 草稿里出现「根本没说过的话」时，别往浮窗上放。判据只有两条，
+                # 都是实测站得住的（见 src/halluc.py 顶部）：整段是模型的内部
+                # 标记词、或者前面说中文这一段却一个汉字都没有。
+                # 判成可疑也照样 emit（trusted=False），让 buffer 保留原文，
+                # 好让终稿重解有得比对 —— 只影响显示，不改上屏内容。
+                why = halluc.judge(text, self._saw_cjk)
+                if why:
+                    log.warning("草稿暂不显示（%s）：%s", why, text[:60])
+                elif halluc.has_cjk(text):
+                    self._saw_cjk = True
+                self.bridge.segment.emit(text, gap, not why)
         except Exception as e:
             log.exception(e)
             self.bridge.error.emit(f"识别出错: {e}")
 
-    def _on_segment_ui(self, text: str, gap: int = 0):
+    def _on_segment_ui(self, text: str, gap: int = 0, trusted: bool = True):
         self.buffer.append((text, gap))
-        self.hud.set_text("".join(t for t, _ in self.buffer))
+        self._trust.append(trusted)
+        # 不可信的段在浮窗上留空：既不让它显示出来，也不打乱已显示的顺序。
+        # 真话不会因此丢掉 —— 它在 buffer 里，终稿重解会补回浮窗。
+        self._disp.append(text if trusted else "")
+        self.hud.set_text("".join(self._disp))
         self.hud.set_state("recording")
+
+    def _draft_for_display(self, final: str, level: int) -> str:
+        """草稿的「可显示版」：跳过不可信的段，其余照正常流程处理。
+
+        只在确实有段被判可疑时才重算一次（正则级，微秒级），平时原样返回，
+        跟改动前一模一样。
+        """
+        if all(self._trust):
+            return final
+        keep = [seg for seg, ok in zip(self.buffer, self._trust) if ok]
+        if not keep:
+            return ""
+        shown = process(_join_segments(keep), CONFIG.get("text"))
+        if level == 1:
+            shown = rule_polish(shown, 1)
+        return shown
 
     def _on_release(self):
         log.info("热键松开")
@@ -926,6 +975,12 @@ class App:
             # 不走「先上屏原文再等整理」那条路，所以这一档是真正的零等待。
             final = rule_polish(final, 1)
         self._last_raw = final
+        # 浮窗上显示的那一份：跳过被判可疑的段。上屏内容一步都不改 ——
+        # 走的是 shown 这个副本，final 原样交给 _paste 和重解。
+        shown = self._draft_for_display(final, level)
+        if not shown and final:
+            # 整轮都被判可疑，浮窗空着会像「什么都没识别到」，给个占位
+            shown = "…"
 
         want_polish = level >= 2
         # 「等整理好一次写进去」不只对书面化有意义。去口水词（level=1）这一档
@@ -937,7 +992,7 @@ class App:
 
         if direct:
             log.info("直写模式：草稿只走浮窗，等终稿再写入（级别 %d）", level)
-            self.hud.show_hud("polishing", final)
+            self.hud.show_hud("polishing", shown)
             self.hud.set_hint("整段重解 + 整理中，会直接写进光标" if want_polish
                               else "整段重解中，好了直接写进光标")
             self._start_polish(final, level, direct=True, utterance=utterance)
@@ -959,15 +1014,18 @@ class App:
                 # 重新 show 出来 —— 用户看到的就是「消失一下再弹出来」。
                 # 所以这里给一个远大于整理耗时的兜底时长：正常情况下整理回来
                 # 时 show_hud() 会取消这个定时器；万一整理卡死，15 秒后自己收。
-                self.hud.flash("done", final, 30000)
+                self.hud.flash("done", shown, 30000)
                 self.hud.set_hint("整段重解 + 整理中…")
             elif utterance is not None:
                 # 没开整理、但还要整段重解。同样不能让浮窗先关掉再弹回来：
                 # 重解 24 秒音频实测要 9.8 秒，1.6 秒的 flash 根本盖不住。
                 # 用户实测投诉的就是这条路径（level=1 时窗口关了又冒出来）。
-                self.hud.flash("done", final, 30000)
+                self.hud.flash("done", shown, 30000)
                 self.hud.set_hint("整段重解中…")
             else:
+                # 这一档后面没有任何结果会回来，浮窗显示的就是真正写进去的字。
+                # 所以这里给 final 而不是 shown：宁可让它跟输入框一致，
+                # 也不能出现「框里有、浮窗没有」这种对不上的情况。
                 self.hud.flash("done", final, 1600)
         # 没有整理时也要走一遍：整段重解能把分段边界丢的字补回来
         if want_polish or utterance is not None:
@@ -1513,7 +1571,7 @@ def main():
     app = App(qt)
     # 启动标记：每次部署完先看这一行，确认跑的是哪一版、哪个行为开关生效。
     # 没有这行就只能靠猜（曾经把「应该已经生效」当成结论报给用户）。
-    log.info("启动标记 BUILD=2026-10-30-r15 版本=%s 整段重解上限=%.0fs "
+    log.info("启动标记 BUILD=2026-10-31-r16 版本=%s 整段重解上限=%.0fs "
              "分块上限=%.0fs×%d 粘贴模式=%s 整理级别=%s 自动替换=%s",
              APP_VERSION,
              _MAX_REDECODE_SEC, _CHUNK_SEC, _MAX_CHUNKS,
