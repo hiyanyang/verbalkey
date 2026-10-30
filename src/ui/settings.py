@@ -735,6 +735,24 @@ class SettingsWindow(QMainWindow):
         c3.add_row("繁体输出", self.sw_trad, "打出来是繁体字")
         self._put(lay, c3)
 
+        # 卡 3.5：中英文切换键
+        # 小狼毫默认只绑了左 Shift，右 Shift 是 noop —— 按了完全没反应，
+        # 很多人以为「Shift 切不了中英文」就是这个原因。
+        c3b = Card("中英文切换",
+                   "单按一下 Shift 就切中英文。正在打拼音时按，"
+                   "会把已经打出来的字母当英文上屏，再切到英文。")
+        self.sw_shift_l = Switch()
+        self.sw_shift_l.setChecked(s["shift_left"])
+        self.sw_shift_l.toggled.connect(self._save_ime)
+        c3b.add_row("左 Shift", self.sw_shift_l, "键盘左边那个 Shift，单按一下切中英文")
+
+        self.sw_shift_r = Switch()
+        self.sw_shift_r.setChecked(s["shift_right"])
+        self.sw_shift_r.toggled.connect(self._save_ime)
+        c3b.add_row("右 Shift", self.sw_shift_r,
+                    "关掉它，「右 Shift + 字母」就还是打大写")
+        self._put(lay, c3b)
+
         # 卡 4：生效
         c4 = Card("生效", "Rime 的配置改完要重新编译一次（约 10 秒）。")
         self.btn_ime_apply = QPushButton("应用并重新编译")
@@ -792,6 +810,9 @@ class SettingsWindow(QMainWindow):
         self._save("rime", "font_point", self.sp_ime_font.value())
         self._save("rime", "emoji", self.sw_emoji.isChecked())
         self._save("rime", "traditional", self.sw_trad.isChecked())
+        if hasattr(self, "sw_shift_l"):
+            self._save("rime", "shift_left", self.sw_shift_l.isChecked())
+            self._save("rime", "shift_right", self.sw_shift_r.isChecked())
         problems: list[str] = []
         try:
             problems = rime_setup.write_custom() or []

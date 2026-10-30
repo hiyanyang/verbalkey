@@ -255,6 +255,11 @@ def read_ime_settings() -> dict:
         "font_point": int(d.get("font_point") or 14),
         "emoji": bool(d.get("emoji", True)),
         "traditional": bool(d.get("traditional") or False),
+        # 单按左右 Shift 切中英文。默认两个都开：
+        # 雾凇默认只绑了左 Shift（右 Shift 是 noop，按了完全没反应），
+        # 用户反馈「单按 Shift 切不了」，多半按的是右边那个。
+        "shift_left": bool(d.get("shift_left", True)),
+        "shift_right": bool(d.get("shift_right", True)),
     }
 
 
@@ -372,8 +377,16 @@ def _verify_custom(schema_file: str, s: dict, icon_wanted: bool) -> list[str]:
             return False
 
     problems: list[str] = []
-    if not has(dst / "default.custom.yaml", f"- schema: {schema_file}"):
+    dc = dst / "default.custom.yaml"
+    if not has(dc, f"- schema: {schema_file}"):
         problems.append("方案列表没写进去")
+    # 中英文切换键：只校验「写进去了没有」，写的值是否符合设置。
+    # 刻意不在这里查 build/default.yaml —— 那份要重新部署才会更新，
+    # 保存设置时查必然误报「没写进去」。
+    for key, want in (("Shift_L", s["shift_left"]), ("Shift_R", s["shift_right"])):
+        val = "commit_code" if want else "noop"
+        if not has(dc, f"ascii_composer/switch_key/{key}: {val}"):
+            problems.append(f"{key} 切换键没写进去")
     weasel = dst / "weasel.custom.yaml"
     if not has(weasel, "style/color_scheme: verbalkey"):
         problems.append("候选窗配色没写进去")
@@ -402,10 +415,15 @@ def write_custom() -> list[str]:
     label_px = max(10, s["font_point"] - 1)
     comment_px = max(9, s["font_point"] - 2)
 
-    # 1) default.custom.yaml：方案列表 + 每页候选数
+    # 1) default.custom.yaml：方案列表 + 每页候选数 + 中英文切换键
+    #    switch_key 的取值见 Rime default.yaml 注释：
+    #      commit_code = 把已输入的字母当英文上屏，再切到英文模式
+    #      noop        = 这个键什么都不做
     _merge_patch(dst / "default.custom.yaml", {
         "schema_list": [f"    - schema: {schema_file}"],
         "menu/page_size": str(s["page_size"]),
+        "ascii_composer/switch_key/Shift_L": "commit_code" if s["shift_left"] else "noop",
+        "ascii_composer/switch_key/Shift_R": "commit_code" if s["shift_right"] else "noop",
     })
 
     # 2) weasel.custom.yaml：候选窗样式，对齐语音浮窗的视觉
