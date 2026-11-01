@@ -491,10 +491,6 @@ def write_custom() -> list[str]:
     apply_weasel_style()
     return _verify_custom(schema_file, s, icon_wanted)
 
-    # custom.yaml 只是"声明"，小狼毫实际读的是 build/weasel.yaml，
-    # 那个文件只有它自己的 GUI 部署器才会重建 —— 所以直接写一份进去
-    apply_weasel_style()
-
 
 # 候选窗配色（Weasel 用 0xBBGGRR，是 BGR 不是 RGB）
 #   PINK #FF2D55 → 0x552DFF    INK #1D1D1F → 0x1F1D1D

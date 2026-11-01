@@ -141,6 +141,16 @@ def install_zip(zip_path: Path, keep_user_phrases: bool = True) -> tuple[bool, s
 
     # 配置和样式是程序管的，覆盖完要重写一遍，否则用户的自定义会被冲掉
     rime_setup.write_custom()
+
+    # default.yaml 也被 zip 覆盖回雾凇原版，它的 config_version 是横杠格式
+    # （'2026-02-06'）。Rime 只认点分格式，解析失败按 0 算，0 < 共享目录的
+    # 0.40 → 用户配置整体被忽略，编译出来变成 luna_pinyin 那套，雾凇拼音
+    # 会消失且不报任何错。deploy_ice() 一直有这一步，升级这条路漏了：
+    # 点一次「词库更新」，输入法当场变回默认方案。
+    inst = rime_setup.rime_install_dir()
+    if inst is not None:
+        rime_setup._fix_config_version(dst, inst)
+
     ok, msg = rime_setup.trigger_deploy()
     note = f"已铺 {copied} 个文件"
     if skipped_phrase:
