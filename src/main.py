@@ -1544,6 +1544,20 @@ def _self_heal_paths() -> None:
 def _boot_rime() -> None:
     """开机那一轮：先把指错的路径纠回来，再拉起服务。"""
     _self_heal_paths()
+    # 候选窗样式写在 build/weasel.yaml 里，而那个文件只有小狼毫的 GUI 部署器
+    # 才会重建（用户在托盘点一次「重新部署」就会变），它偏偏又是 WeaselServer
+    # 真正读的那份 —— 一旦和设置漂移，界面不报任何错，只是字号/配色悄悄变了。
+    # 2026-11-01 实测过一次：设置是 24，文件里却是 20。
+    # 这里在拉起服务之前对一遍，不一致就重写，服务起来读到的就是对的，
+    # 不用额外重启（重启会让正在打的字丢掉）。
+    from . import rime_setup
+    try:
+        fixed = rime_setup.ensure_weasel_style()
+    except Exception as e:          # 样式自检不该拖垮启动
+        log.warning("候选窗样式自检失败（忽略）：%s", e)
+        fixed = ""
+    if fixed:
+        log.info("候选窗样式自愈：%s", fixed)
     _start_rime_service()
 
 
@@ -1571,7 +1585,7 @@ def main():
     app = App(qt)
     # 启动标记：每次部署完先看这一行，确认跑的是哪一版、哪个行为开关生效。
     # 没有这行就只能靠猜（曾经把「应该已经生效」当成结论报给用户）。
-    log.info("启动标记 BUILD=2026-11-01-r17 版本=%s 整段重解上限=%.0fs "
+    log.info("启动标记 BUILD=2026-11-01-r18 版本=%s 整段重解上限=%.0fs "
              "分块上限=%.0fs×%d 粘贴模式=%s 整理级别=%s 自动替换=%s",
              APP_VERSION,
              _MAX_REDECODE_SEC, _CHUNK_SEC, _MAX_CHUNKS,

@@ -514,6 +514,38 @@ _WEASEL_COLORS = {
 }
 
 
+LAYOUT_PREFIX = "@layout/"
+
+# 圆角 / 留白 / 阴影，照语音浮窗的观感
+_LAYOUT_VALUES = (
+    ("corner_radius", 12), ("round_corner", 8), ("border_width", 1),
+    ("margin_x", 12), ("margin_y", 8), ("candidate_spacing", 18),
+    ("hilite_padding", 6), ("hilite_spacing", 6),
+    ("shadow_radius", 8), ("shadow_offset_x", 0), ("shadow_offset_y", 3),
+)
+
+
+def _style_expect(s: dict) -> dict[str, str]:
+    """候选窗样式的期望值，键带 `@layout/` 前缀的是 layout 段内的项。
+
+    写入（`apply_weasel_style`）和比对（`style_drift`）共用这一份，
+    两处各写一遍必然漂移 —— 这份代码以前就吃过这个亏。
+    """
+    d = {
+        "color_scheme": "verbalkey",
+        "font_face": '"Microsoft YaHei UI, Segoe UI Emoji"',
+        "label_font_face": '"Microsoft YaHei UI"',
+        "comment_font_face": '"Microsoft YaHei UI"',
+        "font_point": str(s["font_point"]),
+        "label_font_point": str(max(10, s["font_point"] - 1)),
+        "comment_font_point": str(max(9, s["font_point"] - 2)),
+        "horizontal": "true" if s["horizontal"] else "false",
+    }
+    for key, val in _LAYOUT_VALUES:
+        d[LAYOUT_PREFIX + key] = str(val)
+    return d
+
+
 def apply_weasel_style() -> bool:
     """把候选窗样式直接写进 `build/weasel.yaml`。
 
@@ -548,26 +580,11 @@ def apply_weasel_style() -> bool:
         text = re.sub(rf"^    {key}:\s*.*$", f"    {key}: {val}",
                       text, count=1, flags=re.M)
 
-    top("color_scheme", "verbalkey")
-    top("font_face", '"Microsoft YaHei UI, Segoe UI Emoji"')
-    top("label_font_face", '"Microsoft YaHei UI"')
-    top("comment_font_face", '"Microsoft YaHei UI"')
-    top("font_point", s["font_point"])
-    top("label_font_point", max(10, s["font_point"] - 1))
-    top("comment_font_point", max(9, s["font_point"] - 2))
-    top("horizontal", "true" if s["horizontal"] else "false")
-    # 圆角 / 留白 / 阴影，照语音浮窗的观感
-    layout("corner_radius", 12)
-    layout("round_corner", 8)
-    layout("border_width", 1)
-    layout("margin_x", 12)
-    layout("margin_y", 8)
-    layout("candidate_spacing", 18)
-    layout("hilite_padding", 6)
-    layout("hilite_spacing", 6)
-    layout("shadow_radius", 8)
-    layout("shadow_offset_x", 0)
-    layout("shadow_offset_y", 3)
+    for key, val in _style_expect(s).items():
+        if key.startswith(LAYOUT_PREFIX):
+            layout(key[len(LAYOUT_PREFIX):], val)
+        else:
+            top(key, val)
 
     # 配色方案：已经有 verbalkey 段就先剔掉，避免重复插入
     text = re.sub(r"^  verbalkey:\n(?:    [^\n]*\n)+", "", text, count=1, flags=re.M)
@@ -582,6 +599,79 @@ def apply_weasel_style() -> bool:
     except OSError:
         return False
     return True
+
+
+def style_drift() -> list[tuple[str, str, str]]:
+    """比对 `build/weasel.yaml` 与设置，返回 [(项, 当前值, 期望值)]。空=一致。
+
+    这个文件只有小狼毫的 GUI 部署器（WeaselDeployer.exe）才会重建，librime 的
+    `rime_deployer --build` 不碰它；它又是 WeaselServer 真正读的那份。所以只要
+    有人重建过它（用户点「重新部署」、装新版小狼毫、或者别的工具动了设置），
+    它就会和我们的设置对不上，而界面不会报任何错 —— 用户只会觉得「字号怎么变小了」。
+    """
+    p = user_rime_dir() / "build" / "weasel.yaml"
+    if not p.exists():
+        return [("build/weasel.yaml", "不存在", "应由程序生成")]
+    try:
+        text = p.read_text(encoding="utf-8", errors="ignore")
+    except OSError as e:
+        return [("build/weasel.yaml", f"读不了（{type(e).__name__}）", "可读")]
+
+    expect = _style_expect(read_ime_settings())
+    out: list[tuple[str, str, str]] = []
+    for key, want in expect.items():
+        if key.startswith(LAYOUT_PREFIX):
+            name = key[len(LAYOUT_PREFIX):]
+            pat = rf"^    {name}:\s*(.*)$"
+        else:
+            name, pat = key, rf"^  {key}:\s*(.*)$"
+        m = re.search(pat, text, re.M)
+        got = m.group(1).strip() if m else "（缺失）"
+        if got != want:
+            out.append((name, got, want))
+    return out
+
+
+def ensure_weasel_style() -> str:
+    """启动自愈：`build/weasel.yaml` 和设置不一致就重写。返回动作描述，空串=没动。
+
+    **必须在拉起 WeaselServer 之前调用**（`start_service()` 前），这样服务起来
+    读到的就是新内容，不用再重启一次服务打断用户。
+
+    文件不存在时从安装目录的 `data/weasel.yaml` 复制一份模板再改 —— 从没部署过
+    的机器也能有样式，而不是一直返回 False 什么都不做。
+    """
+    p = user_rime_dir() / "build" / "weasel.yaml"
+    if not p.exists():
+        inst = rime_install_dir()
+        if inst is None:
+            return ""       # 没装 Rime，设置页那边本来就有提示，这里不重复喊
+        src = inst / "data" / "weasel.yaml"
+        if not src.exists():
+            src = inst / "weasel.yaml"
+        if not src.exists():
+            return f"找不到模板 {src}，候选窗样式无法生成"
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, p)
+        except OSError as e:
+            return f"模板复制失败：{e}"
+        apply_weasel_style()
+        left = style_drift()
+        if left:
+            return f"从模板重建后仍不一致：{left[0][0]} {left[0][1]}≠{left[0][2]}"
+        return "build/weasel.yaml 缺失，已从模板重建"
+
+    diff = style_drift()
+    if not diff:
+        return ""
+    apply_weasel_style()
+    left = style_drift()
+    if left:
+        # 写不进去（文件只读、被占用）时如实说，别假装修好了
+        return ("重写后仍不一致：" +
+                "；".join(f"{n} {a}≠{b}" for n, a, b in left[:4]))
+    return "；".join(f"{n} {a}→{b}" for n, a, b in diff[:6])
 
 
 def bundled_icon() -> Path | None:
