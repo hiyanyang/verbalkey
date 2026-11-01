@@ -743,9 +743,183 @@ def phonic_fix(text: str, words: list[str]) -> tuple[str, list[str]]:
             hits.append(f"{old}→{w}")
     if hits:
         log.info("热词同音修正 %d 处：%s", len(hits), "、".join(hits))
+        record_hits(hits)
     if hints:
         log.info("热词同音但声调不同，未改（要改请手动）：%s", "、".join(hints))
     return text, hits
+
+
+# ---------------------------------------------------------- 命中统计
+#
+# 目的：让人看出「哪些热词从来没派上用场」。
+#
+# 只记词本身和次数，**不记任何识别文本** —— 这跟 corpus.jsonl 是两回事，
+# 那个存的是你说过的完整句子（你已知情）。hits.json 里只有你自己填过的词。
+#
+# 「从未命中」不等于「没用」：刚填进去的词还没遇到说它的机会。所以每条
+# 记录带一个 first（第一次出现在词表里的时间），清理时按它留出观察期。
+
+HITS_PATH = HOTWORD_DIR / "hits.json"
+_HIT_GRACE_DAYS = 3     # 刚加的词先观察 3 天，免得刚填就被判「没用」删掉
+
+_hits_cache: dict[str, dict] | None = None
+_hit_lock = threading.Lock()
+
+
+def _hits() -> dict[str, dict]:
+    """读统计表。调用方必须已持 _hit_lock。"""
+    global _hits_cache
+    if _hits_cache is None:
+        try:
+            _hits_cache = json.loads(HITS_PATH.read_text(encoding="utf-8")) or {}
+        except Exception:
+            _hits_cache = {}
+    return _hits_cache
+
+
+def _flush_hits() -> None:
+    """落盘。调用方必须已持 _hit_lock。"""
+    try:
+        HOTWORD_DIR.mkdir(parents=True, exist_ok=True)
+        HITS_PATH.write_text(
+            json.dumps(_hits_cache or {}, ensure_ascii=False, indent=1,
+                       sort_keys=True), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def touch(words: list[str]) -> None:
+    """给词表里第一次出现的词记下「加入时间」。
+
+    以后判断「从未命中」要靠它区分「加了很久没用上」和「刚加还没机会验证」。
+    """
+    if not words:
+        return
+    now = int(time.time())
+    with _hit_lock:
+        t = _hits()
+        changed = False
+        for w in words:
+            if w not in t:
+                t[w] = {"n": 0, "seen": 0, "first": now, "last": 0}
+                changed = True
+        if changed:
+            _flush_hits()
+
+
+def record_hits(hits: list[str]) -> None:
+    """记一次命中。hits 是 phonic_fix 返回的「旧→新」，取右边那个热词。
+
+    每次命中都直接落盘，不做节流 —— 先做过 2 秒节流，结果实测发现
+    「连续说话时最后那几次命中永远写不出去」（进程退出时也不 flush）。
+    命中本来就少（一次识别最多几处），文件几 KB，写一次不到 1ms，
+    相对识别本身的 3~9 秒可以忽略，没必要为它冒丢数据的风险。
+    """
+    if not hits:
+        return
+    words = [h.split("→")[-1].strip() for h in hits]
+    words = [w for w in words if w]
+    if not words:
+        return
+    now = int(time.time())
+    with _hit_lock:
+        t = _hits()
+        for w in words:
+            rec = t.get(w) or {}
+            rec["n"] = int(rec.get("n") or 0) + 1
+            rec["last"] = now
+            rec.setdefault("first", now)
+            t[w] = rec
+        _flush_hits()
+
+
+def record_seen(text: str, words: list[str]) -> None:
+    """记下哪些热词在模型输出里**原样出现了**（同音修正之前）。
+
+    这一条不能省。只统计「修正命中」的话，一个真正有效的 prompt 热词会
+    因为「模型直接听对了、根本轮不到修正」而永远 0 命中，最后被
+    「清理从未命中」当成废词删掉 —— 越有用的词越容易被删，正好反了。
+
+    所以判「没用」的条件是：修正命中 0 次 **且** 原样出现 0 次，
+    也就是「这个词你压根就没说过」。
+    """
+    if not text or not words:
+        return
+    now = int(time.time())
+    with _hit_lock:
+        t = _hits()
+        changed = False
+        for w in words:
+            if not w or w not in text:
+                continue
+            rec = t.get(w) or {}
+            rec["seen"] = int(rec.get("seen") or 0) + 1
+            rec["n"] = int(rec.get("n") or 0)
+            rec["last"] = now
+            rec.setdefault("first", now)
+            t[w] = rec
+            changed = True
+        if changed:
+            _flush_hits()
+
+
+def forget(words: list[str]) -> None:
+    """删掉这些词的统计记录。
+
+    清理词表时必须一起调 —— 否则以后又把同一个词加回来时，first 还是
+    很久以前那个时间，一加进来就被判「从未命中」，刚填的词转眼又被清掉。
+    """
+    if not words:
+        return
+    with _hit_lock:
+        t = _hits()
+        dropped = False
+        for w in words:
+            if t.pop(w, None) is not None:
+                dropped = True
+        if dropped:
+            _flush_hits()
+
+
+def never_hit(words: list[str], days: int = _HIT_GRACE_DAYS) -> list[str]:
+    """挑出「加入超过 days 天、一次都没命中过」的词。"""
+    if not words:
+        return []
+    cutoff = time.time() - days * 86400
+    out: list[str] = []
+    with _hit_lock:
+        t = _hits()
+        for w in words:
+            rec = t.get(w)
+            if rec is None:
+                continue                    # 没有记录就不敢判断
+            # 修正命中过、或者原样出现过，都说明这个词你用得上
+            if int(rec.get("n") or 0) > 0 or int(rec.get("seen") or 0) > 0:
+                continue
+            if float(rec.get("first") or 0) >= cutoff:
+                continue                    # 还在观察期
+            out.append(w)
+    return out
+
+
+def hit_summary(words: list[str]) -> dict:
+    """给界面用：命中过几个、可清理几个、还在观察期几个。"""
+    used = stale = fresh = 0
+    cutoff = time.time() - _HIT_GRACE_DAYS * 86400
+    with _hit_lock:
+        t = _hits()
+        for w in words:
+            rec = t.get(w)
+            if rec is None:
+                fresh += 1
+                continue
+            if int(rec.get("n") or 0) > 0 or int(rec.get("seen") or 0) > 0:
+                used += 1
+            elif float(rec.get("first") or 0) >= cutoff:
+                fresh += 1
+            else:
+                stale += 1
+    return {"total": len(words), "used": used, "stale": stale, "fresh": fresh}
 
 
 def phonic_ready() -> bool:
@@ -775,6 +949,13 @@ def post_fix(text: str, manual: str = "") -> str:
     text = apply_corrections(text)
     words = manual_list(manual)
     if words:
+        # 先在**修正前**的文本上统计原样出现 —— 这一步是判「这个词用不用得上」
+        # 的主要依据。放在修正之后统计的话，刚被改进去的热词也会算一次出现，
+        # 等于自己证明自己有用。
+        try:
+            record_seen(text, words)
+        except Exception as e:
+            log.warning("热词出现统计失败（忽略）：%s", e)
         try:
             text, _ = phonic_fix(text, words)
         except Exception as e:
@@ -791,6 +972,11 @@ def for_asr(manual: str = "") -> str:
     """
     try:
         learn()
+    except Exception:
+        pass
+    # 第一次出现的词记个加入时间，供「清理从未命中」判断观察期
+    try:
+        touch(manual_list(manual))
     except Exception:
         pass
     return build(manual)

@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 import threading
 import winreg
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, Qt, Signal
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QFileDialog, QFrame, QGraphicsDropShadowEffect,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox,
-    QPlainTextEdit, QPushButton, QScrollArea, QStackedWidget, QVBoxLayout, QWidget,
+    QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QStackedWidget,
+    QVBoxLayout, QWidget,
 )
 
 from ..asr import scan_models
@@ -176,6 +178,9 @@ class Card(QFrame):
         self._sep()
         self._row_count += 1
         box = QWidget()
+        # 垂直方向固定：否则卡片里一旦有富余高度，这一行会被拉长，
+        # 表现就是输入框上下各多出一大片空白（高度随内容变时尤其明显）。
+        box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         lay = QHBoxLayout(box)
         lay.setContentsMargins(0, 9, 0, 9)
         lay.addWidget(widget, stretch, alignment)
@@ -520,9 +525,18 @@ class SettingsWindow(QMainWindow):
                           "第 5 个起不进解码，但识别后会按同音／近形改回来，"
                           "不占名额、不限数量 —— 所以词可以放心多加。"
                           "填了要按下面按钮重载识别模型。")
-        self.ed_hw = QLineEdit(str(CONFIG.get("asr", "hotwords") or ""))
-        self.ed_hw.setPlaceholderText("可选：最常被听错的那两三个词")
-        self.ed_hw.setMinimumWidth(360)
+        from .. import hotwords as _hw
+        # 多行输入。原来是单行 QLineEdit：填到第八个词就看不全前面的，
+        # 整串只能左右滚，改中间某个词得先把光标挪半天。
+        self.ed_hw = QPlainTextEdit()
+        self.ed_hw.setPlaceholderText(
+            "一行一个词。也可以直接粘贴「压疮,鼻饲,翻身扣背」这样的串，"
+            "离开输入框时会自动拆成一行一个")
+        # 高度跟着内容走（见 _fit_hw_height）：写死高度要么太松，要么把
+        # 第 8 行切成半行。词再多到 10 行以上才出现滚动。
+        self.ed_hw.setFixedHeight(96)
+        self.ed_hw.setPlainText(
+            "\n".join(_hw.manual_list(str(CONFIG.get("asr", "hotwords") or ""))))
         c3.add_widget(self.ed_hw, Qt.Alignment(), 1)
 
         # 实时容量提示。以前超过上限是**静默丢弃**的：填 12 个看起来
@@ -530,11 +544,18 @@ class SettingsWindow(QMainWindow):
         self.lbl_hw_cnt = QLabel("")
         self.lbl_hw_cnt.setWordWrap(True)
         c3.add_widget(self.lbl_hw_cnt, Qt.Alignment(), 1)
+
+        # 「清理从未命中」平时不出现，只有真攒下可清理的词才显示。
+        self.btn_hw_clean = QPushButton("清理从未用上的词")
+        self.btn_hw_clean.clicked.connect(self._clean_hw_unused)
+        self.btn_hw_clean.setVisible(False)
+        c3.add_widget(self.btn_hw_clean, Qt.Alignment(), 1)
+
         self.ed_hw.textChanged.connect(self._on_hw_changed)
-        self._on_hw_changed(self.ed_hw.text())
+        self.ed_hw.installEventFilter(self)
+        self._on_hw_changed()
 
         try:
-            from .. import hotwords as _hw
             st = _hw.stats()
             bits = []
             if st.get("learned"):
@@ -554,16 +575,18 @@ class SettingsWindow(QMainWindow):
         c3.add_widget(btn)
         self._put(lay, c3)
 
-    def _on_hw_changed(self, text: str) -> None:
-        """热词框改动：写配置 + 刷新「几个进解码」的容量提示。
+    def _on_hw_changed(self) -> None:
+        """热词框改动：写配置 + 刷新容量与命中提示。
 
         超出 MAX_MANUAL **不再标红**：第 5 个起只是不进解码，识别后的
         同音／近形修正照样覆盖。这是正常用法，不是填错。
         """
+        text = self.ed_hw.toPlainText()
         self._save("asr", "hotwords", text)
         try:
             from .. import hotwords as _hw
-            n, cap = len(_hw.manual_list(text)), _hw.MAX_MANUAL
+            words = _hw.manual_list(text)
+            n, cap = len(words), _hw.MAX_MANUAL
             if n == 0:
                 msg = "还没填热词。"
             elif n <= cap:
@@ -571,10 +594,90 @@ class SettingsWindow(QMainWindow):
             else:
                 msg = (f"已填 {n} 个：前 {cap} 个进解码，其余 {n - cap} 个"
                        f"只在识别后按同音／近形修正（同样生效，不限数量）。")
+            # 500 个词实测约 25~45 毫秒（识别本身 3~9 秒），只是提个醒，
+            # 不设限 —— 真正该管的不是速度，是你自己记不记得这些词。
+            if n > 500:
+                msg += f"　词表较大，每次识别后约多花 {n * 0.06:.0f} 毫秒。"
+            sm = _hw.hit_summary(words)
+            if sm["stale"]:
+                msg += (f"　其中 {sm['stale']} 个加入超过 "
+                        f"{_hw._HIT_GRACE_DAYS} 天、一次都没用上。")
             self.lbl_hw_cnt.setText(msg)
             self.lbl_hw_cnt.setStyleSheet(f"color:{MUTED};font-size:13px;")
+            self.btn_hw_clean.setVisible(bool(sm["stale"]))
+            self._fit_hw_height()
         except Exception:
             pass
+
+    def _fit_hw_height(self) -> None:
+        """热词框高度跟着行数走：最少 3 行，最多 10 行，再多才滚动。
+
+        写死高度两个毛病都踩过：太矮时第 8 行只露半个字；按 11 行定死，
+        填两个词的时候又空一大片。所以按实际行数算。
+        """
+        lines = max(3, min(self.ed_hw.document().blockCount(), 10))
+        h = self.ed_hw.fontMetrics().lineSpacing() * lines + 18
+        if self.ed_hw.height() == h:
+            return
+        self.ed_hw.setFixedHeight(h)
+        # 只调 setFixedHeight 不够：父布局仍按上一次的尺寸摆放，
+        # 实测表现是输入框自己变成 198px，外面的容器还停在 90px，
+        # 于是框被挤到中间、上下各留一大片空白。必须逐层刷新。
+        w = self.ed_hw
+        for _ in range(4):
+            w = w.parentWidget()
+            if w is None:
+                break
+            if w.layout() is not None:
+                w.layout().activate()
+            w.updateGeometry()
+
+    def eventFilter(self, obj, ev):
+        """热词框失焦时整理格式。"""
+        if obj is getattr(self, "ed_hw", None) and ev.type() == QEvent.FocusOut:
+            self._normalize_hw()
+        return super().eventFilter(obj, ev)
+
+    def _normalize_hw(self) -> None:
+        """把行内的逗号／顿号拆成换行，只在离开输入框时做。
+
+        为什么要等失焦：正在打字时重排会把光标顶到开头，没法输入。
+        为什么要留空行：你可能会用空行把词分组，那是有意义的结构。
+        """
+        raw = self.ed_hw.toPlainText()
+        new = re.sub(r"[ \t]*[,，、]+[ \t]*", "\n", raw)
+        new = re.sub(r"\n{3,}", "\n\n", new).strip("\n")
+        if new != raw:
+            self.ed_hw.setPlainText(new)
+
+    def _clean_hw_unused(self) -> None:
+        """删掉「加入超过 3 天、一次都没命中过」的词。
+
+        为什么要弹确认：观察期只能挡住 3 天内的新词，剩下的仍然可能是
+        「这周没说到」而不是「永远用不上」。列出来让你看一眼再删，
+        程序不替你决定。删掉的词如果又用到，重新填就行。
+        """
+        from .. import hotwords as _hw
+        words = _hw.manual_list(self.ed_hw.toPlainText())
+        stale = _hw.never_hit(words)
+        if not stale:
+            QMessageBox.information(self, "热词", "现在没有可清理的词。")
+            return
+        preview = "、".join(stale[:30])
+        more = f"\n…等共 {len(stale)} 个" if len(stale) > 30 else ""
+        ok = QMessageBox.question(
+            self, "清理从未命中的热词",
+            f"下面这些词加入超过 {_hw._HIT_GRACE_DAYS} 天，"
+            f"既没在识别结果里出现过，也没被修正命中过：\n\n{preview}{more}\n\n"
+            "删掉后如果以后又用到，需要重新填。确定删除吗？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if ok != QMessageBox.Yes:
+            return
+        drop = set(stale)
+        self.ed_hw.setPlainText("\n".join(w for w in words if w not in drop))
+        # 连统计记录一起删：不删的话，以后又把这个词加回来时会被当成
+        # 「早就加过、一直没命中」，一进来就又被清理掉。
+        _hw.forget(stale)
 
     def _save_replacements(self):
         out = {}
