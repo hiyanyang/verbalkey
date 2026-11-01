@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -936,6 +937,74 @@ def setup_all(on_log=None, on_progress=None, stop=None) -> tuple[bool, str]:
     # 名字和图标换成 Verbalkey（内部会重启 WeaselServer 刷新缓存）
     rebrand()
     return True, "拼音输入法已就绪。按 Win+空格 或 Shift 切到 Verbalkey 就能打拼音"
+
+
+# ---------- 符号输入（v 模式）----------
+# 雾凇拼音自带 symbols_v.yaml：输入 v 加码，候选里直接出符号。
+# 这个功能一直在，但没有任何界面告诉用户它可以怎么用，所以等于不存在。
+# 这里只读表、不写表 —— 用户自己往 symbols_v.yaml 加条目，设置页也会跟着显示。
+# 示例是手工挑的：直接取表里前 8 个会冒出 ‑ ‒ ‱ ⅟ 这类生僻字符，看着像乱码。
+# 「共 N 个」的数量才是现场读的真实值。
+SYMBOL_GROUPS = [
+    ("vsx", "数学", "± ÷ × ≈ ≤ ≥ ∞ √"),
+    ("vbd", "中文标点", "、 。 「 」 『 』 《 》"),
+    ("vbdzy", "中英标点", "— – “ ” ‘ ’ … •"),
+    ("vjt", "箭头", "↑ ↓ ← → ↖ ↗ ⇔ ⇒"),
+    ("vdw", "单位", "℃ ℉ Å ％ ‰ ㎡ ㎜ ㎞"),
+    ("vhb", "货币", "￥ ¥ $ € £ ¢ ₩ ₽"),
+    ("vsb", "上标", "x² y³ 10⁻⁵ ²ⁿᵈ"),
+    ("vxb", "下标", "H₂O CO₂ x₁ aₙ"),
+    ("vxl", "希腊字母", "α β γ π λ μ σ Ω"),
+    ("vpy", "带声调拼音", "ā á ǎ à ē é ě è"),
+    ("vlm", "罗马数字", "ⅰ ⅱ ⅲ ⅳ ⅴ ⅵ ⅶ ⅷ"),
+    ("vfs", "分数", "½ ⅓ ⅔ ¼ ¾ ⅕ ⅖ ⅗"),
+]
+
+
+def _read_symbol_table(user_dir: Path | None = None) -> dict[str, list[str]]:
+    """只解析 symbols_v.yaml 里形如  'vsx': [ a, b, c ]  的单行条目。
+
+    不引 yaml 依赖：打包体积会多一份，这里也只认这一种固定格式。
+    文件缺失/格式变了/读取失败一律返回空字典，由调用方退回内置示例。
+    """
+    log = logging.getLogger(__name__)
+    d = user_dir or user_rime_dir()
+    f = d / "symbols_v.yaml"
+    out: dict[str, list[str]] = {}
+    if not f.exists():
+        return out
+    try:
+        text = f.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        log.warning("读 symbols_v.yaml 失败: %s", e)
+        return out
+    for line in text.splitlines():
+        s = line.strip()
+        if not s.startswith("'"):
+            continue
+        i = s.find("':")
+        if i <= 1:
+            continue
+        rest = s[i + 2:]
+        a, b = rest.find("["), rest.rfind("]")
+        if a < 0 or b <= a:
+            continue
+        items = [x.strip().strip("'\"") for x in rest[a + 1: b].split(",")]
+        items = [x for x in items if x]
+        if items:
+            out[s[1:i]] = items
+    return out
+
+
+def symbol_groups() -> list[tuple[str, str, str, int]]:
+    """返回 [(码, 名称, 示例, 总数)]。
+
+    示例是内置精选；总数现场从本机 symbols_v.yaml 统计，
+    上游更新或用户自己加条目时数量会跟着变。0 表示没读到文件。
+    """
+    table = _read_symbol_table()
+    return [(code, name, sample, len(table.get(code) or []))
+            for code, name, sample in SYMBOL_GROUPS]
 
 
 if __name__ == "__main__":

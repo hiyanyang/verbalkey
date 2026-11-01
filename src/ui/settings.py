@@ -753,6 +753,21 @@ class SettingsWindow(QMainWindow):
                     "关掉它，「右 Shift + 字母」就还是打大写")
         self._put(lay, c3b)
 
+        # 卡 3.6：符号输入速查
+        # 雾凇拼音一直自带这个功能（symbols_v.yaml），但没有任何界面告诉用户怎么打，
+        # 用户只会觉得「没有这个功能」。这里只做速查表，不写任何配置。
+        # 示例现场从本机文件读，用户自己往里加条目也能显示出来。
+        c3c = Card("符号输入",
+                   "打 v 加下面的码，候选里直接出符号。"
+                   "例：vcheng → ×，vsx → 整组数学符号。")
+        for code, name, sample, total in rime_setup.symbol_groups():
+            cnt = QLabel(f"共 {total} 个" if total else "")
+            cnt.setStyleSheet(f"color:{MUTED}; font-size:13px; border:none;")
+            c3c.add_row(f"{code}　{name}", cnt, sample)
+        c3c.add_note("打 vhelp 看全部类别。右侧数量是现场从本机 symbols_v.yaml 统计的；"
+                     "不标数量说明没读到那个文件，符号表可能被删或改坏了。")
+        self._put(lay, c3c)
+
         # 卡 4：生效
         c4 = Card("生效", "Rime 的配置改完要重新编译一次（约 10 秒）。")
         self.btn_ime_apply = QPushButton("应用并重新编译")

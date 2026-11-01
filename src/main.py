@@ -1571,7 +1571,7 @@ def main():
     app = App(qt)
     # 启动标记：每次部署完先看这一行，确认跑的是哪一版、哪个行为开关生效。
     # 没有这行就只能靠猜（曾经把「应该已经生效」当成结论报给用户）。
-    log.info("启动标记 BUILD=2026-10-31-r16 版本=%s 整段重解上限=%.0fs "
+    log.info("启动标记 BUILD=2026-11-01-r17 版本=%s 整段重解上限=%.0fs "
              "分块上限=%.0fs×%d 粘贴模式=%s 整理级别=%s 自动替换=%s",
              APP_VERSION,
              _MAX_REDECODE_SEC, _CHUNK_SEC, _MAX_CHUNKS,
