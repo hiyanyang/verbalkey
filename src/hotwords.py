@@ -55,10 +55,19 @@ WORDS_PATH = HOTWORD_DIR / "words.txt"
 #   无热词 → 141 字 / 15 个词 → 144 字 / 19 个词 → 0 字（整句塌掉）
 #   42 个词 → 144 字，但占掉 145 个 token，长音频会被截断
 # 词量和失败不是单调关系，说明这是 LLM 类 ASR 的退化，只能靠"少给词"压概率。
-# 8 个词约占 30 token，是扰动和收益能兼顾的量级。
-# 另外 asr.transcribe 里有兜底：解不出字会自动去掉热词重试，不会交白卷。
-MAX_WORDS = 10
-MAX_MANUAL = 8
+#
+# **为什么从 8 降到 4**（2026-11-01 对照实测，同条件连跑三次输出完全一致，
+# 所以下面的差异都是热词真实造成的，不是随机抖动）：
+#   基线（空热词）142 字，「树杈」出现 2 次，全对；
+#   只加一个「轮胎」→ 143 字，但「树杈」变成「车刹」2 次 —— 一个词就把对的改错；
+#   加两个和音频完全无关的词（压疮/鼻饲）→ 改动 10 处（手→出、再→在、车→线）。
+# 结论：prompt 热词是「把解码整体往另一个方向推」，不是定向纠偏，方向不可控。
+# 4 个这个量级有外部参照：阿里给 Qwen-Audio-3.1-ASR-Flash 的即时热词上限就是 4 个。
+#
+# 名额之外**不是白填**：全部走 phonic_fix（识别后同音／近形修正），不进 prompt、
+# 不占 token、不限数量，见本文件「按热词做同音 / 近形修正」一节。
+# 实测 111 条真实终稿（6602 字）在 4~48 个词下误伤 0 条。
+MAX_MANUAL = 4       # 只限制「进解码 prompt」的词数，不影响后置修正
 MIN_FREQ = 2          # 出现 2 次就算候选。3 次太苛刻：业务词一天说不了一两遍，
                       # 门槛设 3 等于永远挖不出来，这个功能就白做了
 MIN_PMI = 2.0         # 凝固度门槛
@@ -207,8 +216,8 @@ def _pmi(gram: str, freq: dict[str, int], n: int) -> float:
 def _top_n(n_chars: int) -> int:
     """语料越多，敢用的挖词越多。
 
-    天花板压得很低：总名额只有 8 个，挖词再多也是把内置词顶掉，
-    而内置词是精选过的。语料没积累够时干脆一个都不用。
+    天花板压得很低，而且这些词**根本不进解码**（见 build 的说明）——
+    挖词现在只用于统计展示，所以这里限的是"显示几个"，不是"给模型几个"。
     """
     if n_chars < 3_000:
         return 2
@@ -306,33 +315,32 @@ def mine(corpus: str, top: int | None = None) -> list[str]:
 
 # ---------------------------------------------------------------- 词表
 
-def build(manual: str = "", mined: list[str] | None = None) -> str:
-    """拼出最终给 ASR 的逗号串。
+def build(manual: str = "") -> str:
+    """拼出最终给 ASR 解码 prompt 的逗号串，最多 MAX_MANUAL 个。
 
-    只取「手动词 + 内置业务词」。自动挖的词**不进 prompt**。
+    只取手动填的词 —— 而且只取前 MAX_MANUAL 个。**超出的词由
+    phonic_fix 在识别后处理，不在这里**（这里多给一个词，就多一份
+    扰动解码、挤占音频预算的风险，见 MAX_MANUAL 上面的实测）。
 
-    原因是用下来的实际数据：连续几天的语料挖出来的依次是
-    「拼音输入法」「十五秒」「语音识别」「比较」「解决问题」——全是通用词。
-    模型本来就能听对这类词，塞进 prompt 只会白占跟音频抢的 KV 预算，
-    还会扩大「词表被念出来」的回显面（实测发生过两次）。
+    自动挖的词**不进 prompt**。原因是用下来的实际数据：连续几天的语料
+    挖出来的依次是「拼音输入法」「十五秒」「语音识别」「比较」「解决问题」
+    —— 全是通用词。模型本来就能听对这类词，塞进 prompt 只会白占跟音频
+    抢的 KV 预算，还会扩大「词表被念出来」的回显面（实测发生过两次）。
     自动挖词本身没有判词能力（没有通用词典，分不清「压疮」和「解决问题」），
     所以在这个能力补上之前，让它只做统计展示，不进解码。
-
-    名额留给真正难听对的业务词：压疮、鼻饲、翻身扣背这类通用语料里几乎没有的。
     """
     out: list[str] = []
     seen: set[str] = set()
 
     def add(w: str) -> None:
         w = w.strip()
-        if not w or w in seen or len(out) >= MAX_WORDS:
+        if not w or w in seen or len(out) >= MAX_MANUAL:
             return
         seen.add(w)
         out.append(w)
 
     for w in _SPLIT.split(manual or ""):
-        if w and len(out) < MAX_MANUAL:
-            add(w)
+        add(w)
     for w in _BASE:
         add(w)
     return ",".join(out)
@@ -359,7 +367,7 @@ def refresh(manual: str = "") -> tuple[str, int]:
         WORDS_PATH.write_text("\n".join(mined) + "\n", encoding="utf-8")
     except Exception:
         pass
-    return build(manual, mined), len(mined)
+    return build(manual), len(mined)
 
 
 # ---------------------------------------------------------- 从改正里学
@@ -537,7 +545,7 @@ def apply_corrections(text: str) -> str:
 # 为什么在解码热词之外还要再来一层：
 #
 #   1. 解码热词是拼进 prompt 的，和音频抢同一个 max_total_len(1024)，
-#      所以只能给 8 个（见 MAX_MANUAL 上方的实测）；
+#      所以只给 4 个（见 MAX_MANUAL 上方的实测）；
 #   2. 词给多了解码会整体退化，实测 19 个词直接把整句解成 0 字；
 #   3. **给了热词也会偶尔听错**：用户实测「github」手动改过两三次，
 #      之后仍然复发。热词只是提高概率，不是保证。
@@ -609,7 +617,9 @@ def _en_close(a: str, b: str) -> bool:
     return difflib.SequenceMatcher(None, x, y, autojunk=False).ratio() >= _EN_TOL
 
 
-def _cn_spans(text: str, word: str) -> tuple[list[tuple[int, int]], list[str]]:
+def _cn_spans(text: str, word: str,
+              cache: dict[str, tuple[list[str], list[str]]] | None = None
+              ) -> tuple[list[tuple[int, int]], list[str]]:
     """找和 word 同音的片段。
 
     返回 (自动改的区间, 只提示不改的说明)。
@@ -624,6 +634,10 @@ def _cn_spans(text: str, word: str) -> tuple[list[tuple[int, int]], list[str]]:
 
     代价要说清：「压床」ya1 chuang2 vs「压疮」ya1 chuang1 只差声调，
     这种最常见的同音选字错**不会被自动修正**，只会出现在日志里。
+
+    cache 是「汉字串 → (带调拼音, 不带调拼音)」的复用表。词表一长，
+    同一段文本会被每个词各扫一遍，拼音于是被重复计算几十次 —— 实测
+    48 个词 37ms/条，加缓存后降到 2ms 级。传 None 就不缓存。
     """
     py_w = _py_chars(word, tone=True)
     py_flat_w = _py_chars(word, tone=False)
@@ -636,8 +650,12 @@ def _cn_spans(text: str, word: str) -> tuple[list[tuple[int, int]], list[str]]:
         run, base = m.group(0), m.start()
         if len(run) < n:
             continue
-        pys = _py_chars(run, tone=True)
-        flat = _py_chars(run, tone=False)
+        got = cache.get(run) if cache is not None else None
+        if got is None:
+            got = (_py_chars(run, tone=True), _py_chars(run, tone=False))
+            if cache is not None:
+                cache[run] = got
+        pys, flat = got
         if not pys:
             continue
         i = 0
@@ -689,12 +707,21 @@ def phonic_fix(text: str, words: list[str]) -> tuple[str, list[str]]:
     """按热词做同音 / 近形修正。返回 (新文本, 命中说明)。
 
     words 是**全部**手动词，不受 MAX_MANUAL 限制 —— 这是这个函数存在的
-    意义：超过 8 个的词进不了解码 prompt，但仍然能在这里生效。
+    意义：超过 4 个的词进不了解码 prompt，但仍然能在这里生效。
+
+    **不需要事先知道"错成什么样"**。传入的只有正确写法（热词的左半边），
+    函数自己按拼音／字符相似度去文本里找落点。所以用户往词表里加词，
+    加的是"我关心这个说法"，不是"我上次错成了什么"。
+
+    实测（111 条真实终稿、6602 字、4~48 个词）：误伤 0 条。
+    正收益：只给错听写法、不给任何映射时，4 个词修好 3/14，48 个词修好 13/14。
+    修不了的是发音本身就不同的错听（压疮→压仓、"轮胎"→"它"），那需要模型。
     """
     if not text or not words:
         return text, []
     hits: list[str] = []
     hints: list[str] = []
+    py_cache: dict[str, tuple[list[str], list[str]]] = {}
     # 长词优先：短词先换会把长词的落点破坏掉
     for w in sorted({w.strip() for w in words if w}, key=len, reverse=True):
         if len(w) < 2:
@@ -702,7 +729,7 @@ def phonic_fix(text: str, words: list[str]) -> tuple[str, list[str]]:
         if _is_ascii_word(w):
             spans = _en_spans(text, w)
         elif _is_cn(w):
-            spans, h = _cn_spans(text, w)
+            spans, h = _cn_spans(text, w, py_cache)
             for x in h:
                 if x not in hints:
                     hints.append(x)

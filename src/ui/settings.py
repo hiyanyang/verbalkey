@@ -516,16 +516,17 @@ class SettingsWindow(QMainWindow):
         c2.add_widget(self.txt_rep, Qt.AlignLeft, 1)
         self._put(lay, c2)
 
-        c3 = Card("热词", "只对语音输入生效，跟拼音输入法无关。前 8 个进解码；"
-                          "超出的不进解码，但识别后会按同音／近形自动改回来"
-                          "（不占名额）。填了要按下面按钮重载识别模型。")
+        c3 = Card("热词", "只对语音输入生效，跟拼音输入法无关。前 4 个进解码；"
+                          "第 5 个起不进解码，但识别后会按同音／近形改回来，"
+                          "不占名额、不限数量 —— 所以词可以放心多加。"
+                          "填了要按下面按钮重载识别模型。")
         self.ed_hw = QLineEdit(str(CONFIG.get("asr", "hotwords") or ""))
         self.ed_hw.setPlaceholderText("可选：最常被听错的那两三个词")
         self.ed_hw.setMinimumWidth(360)
         c3.add_widget(self.ed_hw, Qt.Alignment(), 1)
 
-        # 实时容量提示。以前超过 8 个是**静默丢弃**的：填 12 个看起来
-        # 全部生效，实际只有前 8 个进解码，界面上一个字都不提。
+        # 实时容量提示。以前超过上限是**静默丢弃**的：填 12 个看起来
+        # 全部生效，实际只有前几个进解码，界面上一个字都不提。
         self.lbl_hw_cnt = QLabel("")
         self.lbl_hw_cnt.setWordWrap(True)
         c3.add_widget(self.lbl_hw_cnt, Qt.Alignment(), 1)
@@ -554,23 +555,24 @@ class SettingsWindow(QMainWindow):
         self._put(lay, c3)
 
     def _on_hw_changed(self, text: str) -> None:
-        """热词框改动：写配置 + 刷新「几个进解码」的容量提示。"""
+        """热词框改动：写配置 + 刷新「几个进解码」的容量提示。
+
+        超出 MAX_MANUAL **不再标红**：第 5 个起只是不进解码，识别后的
+        同音／近形修正照样覆盖。这是正常用法，不是填错。
+        """
         self._save("asr", "hotwords", text)
         try:
             from .. import hotwords as _hw
-            words = _hw.manual_list(text)
-            n, cap = len(words), _hw.MAX_MANUAL
+            n, cap = len(_hw.manual_list(text)), _hw.MAX_MANUAL
             if n == 0:
-                msg, over = "还没填热词。", False
+                msg = "还没填热词。"
             elif n <= cap:
-                msg, over = f"已填 {n} 个，全部进解码。", False
+                msg = f"已填 {n} 个：全部进解码，也全部参与识别后修正。"
             else:
-                over = True
-                msg = (f"已填 {n} 个：前 {cap} 个进解码，"
-                       f"其余 {n - cap} 个只在识别后按同音／近形修正。")
+                msg = (f"已填 {n} 个：前 {cap} 个进解码，其余 {n - cap} 个"
+                       f"只在识别后按同音／近形修正（同样生效，不限数量）。")
             self.lbl_hw_cnt.setText(msg)
-            self.lbl_hw_cnt.setStyleSheet(
-                f"color:{PINK if over else MUTED};font-size:13px;")
+            self.lbl_hw_cnt.setStyleSheet(f"color:{MUTED};font-size:13px;")
         except Exception:
             pass
 

@@ -668,11 +668,16 @@ class App:
                 hw = hotwords.for_asr(manual)
                 log.info(f"热词 {len(hw.split(',')) if hw else 0} 个：{hw[:80]}")
                 # 热词框里一共几个 / 同音修正能不能用，都要在启动时留一行，
-                # 否则「填了 11 个却只有 8 个进解码」「中文一条都没改」这类
+                # 否则「填了 11 个却只有 4 个进解码」「中文一条都没改」这类
                 # 情况在日志里完全看不出来。
-                log.info("热词共填 %d 个（进解码上限 %d），同音修正%s",
-                         len(hotwords.manual_list(manual)),
-                         hotwords.MAX_MANUAL,
+                # 进解码的实际个数是 min(填的个数, 上限) —— 只填 3 个时
+                # 日志不能说「进解码 4 个」，那是上限不是实况。
+                n_manual = len(hotwords.manual_list(manual))
+                log.info("热词共填 %d 个（进解码 %d 个，其余 %d 个只在识别后修正），"
+                         "同音修正%s",
+                         n_manual,
+                         min(n_manual, hotwords.MAX_MANUAL),
+                         max(0, n_manual - hotwords.MAX_MANUAL),
                          "可用" if hotwords.phonic_ready()
                          else "不可用：pypinyin 没加载到，中文热词不生效")
                 secs = self.asr.load(
@@ -1132,7 +1137,7 @@ class App:
         text = process(text, CONFIG.get("text"))
         # 输出后修正两步：先学到的精确替换，再按热词做同音 / 近形修正。
         # 两步都不进解码 prompt —— 不占音频预算、不引幻觉，也不受
-        # MAX_MANUAL(8) 的名额限制：超过 8 个的热词在这里仍然生效。
+        # MAX_MANUAL(4) 的名额限制：第 5 个及以后的热词只在这里生效。
         try:
             text = hotwords.post_fix(
                 text, str(CONFIG.get("asr", "hotwords") or ""))
@@ -1595,7 +1600,7 @@ def main():
     app = App(qt)
     # 启动标记：每次部署完先看这一行，确认跑的是哪一版、哪个行为开关生效。
     # 没有这行就只能靠猜（曾经把「应该已经生效」当成结论报给用户）。
-    log.info("启动标记 BUILD=2026-11-01-r19 版本=%s 整段重解上限=%.0fs "
+    log.info("启动标记 BUILD=2026-11-01-r20 版本=%s 整段重解上限=%.0fs "
              "分块上限=%.0fs×%d 粘贴模式=%s 整理级别=%s 自动替换=%s",
              APP_VERSION,
              _MAX_REDECODE_SEC, _CHUNK_SEC, _MAX_CHUNKS,
