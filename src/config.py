@@ -26,7 +26,7 @@ def _app_dir() -> Path:
 
 APP_NAME = "Verbalkey"
 # 发版号。发布包名、日志启动行、设置页显示都用它，改一处就够
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1"
 APP_DIR = _app_dir()
 CONFIG_PATH = APP_DIR / "config.json"
 MODELS_DIR = APP_DIR / "models"

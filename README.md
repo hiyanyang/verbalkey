@@ -139,7 +139,7 @@
 |---|---|---|
 | **在压缩包预览窗口里直接双击 exe** | 报「找不到 XXXXX.dll」或闪一下就没了。压缩包只是个壳，里面的文件还没真正落地 | 先解压，再进解压出来的文件夹双击 |
 | 解压到 `C:\Program Files` 或 `C:\Windows` 下 | 装完提示找不到模型。那两个目录普通权限写不进去，模型下不下来 | 解压到桌面、文档、D 盘都行。路径**别带空格和特殊符号**最稳 |
-| 只把 `Verbalkey.exe` 拷到别处 | 打不开。这个 exe 只有 4.7 MB，真正的东西在同目录的 `_internal\` 里 | 挪位置就**整个 `Verbalkey` 文件夹一起**挪，或者先压成 zip 再搬 |
+| 只把 `Verbalkey.exe` 拷到别处 | 打不开。这个 exe 只有几 MB，真正的东西在同目录的 `_internal\` 里 | 挪位置就**整个 `Verbalkey` 文件夹一起**挪，或者先压成 zip 再搬 |
 
 解压后应该是 `Verbalkey\Verbalkey.exe` 这一层。如果你解压出来是
 `Verbalkey\Verbalkey\Verbalkey.exe`，多套了一层，进里层那个就行。
@@ -148,13 +148,17 @@
 
 ```bash
 python -m venv .venv
-.venv\Scripts\python.exe -m pip install sherpa-onnx PySide6 sounddevice numpy opencc-python-reimplemented
+.venv\Scripts\python.exe -m pip install sherpa-onnx PySide6 sounddevice numpy opencc-python-reimplemented pypinyin
 .venv\Scripts\python.exe tools\fetch_models.py --group vad,asr
 .venv\Scripts\python.exe entry.py
 ```
 
 也可以直接跑 `install.bat`，它把上面三步串起来了（`install.bat full` 连书面化一起装）。
 只有这条路需要 Python。
+
+`pypinyin` 是可选依赖：漏装程序照样起得来，但**中文热词的同音修正会整段跳过**，
+症状是「填了热词却没有任何效果」，启动日志里会写一行 `同音修正不可用：pypinyin 没加载到`。
+用发布包（方式一）的人不需要管这条 —— 它已经打进 `_internal/` 了。
 
 ### 模型下载器
 

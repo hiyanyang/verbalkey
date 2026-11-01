@@ -54,11 +54,11 @@ if not exist "%VK_VENV%\Scripts\python.exe" (
 echo.
 echo [2/4] 安装依赖（首次约 3-5 分钟）...
 "%VK_VENV%\Scripts\python.exe" -m pip install --upgrade pip --quiet
-"%VK_VENV%\Scripts\python.exe" -m pip install sherpa-onnx PySide6 sounddevice numpy opencc-python-reimplemented
+"%VK_VENV%\Scripts\python.exe" -m pip install sherpa-onnx PySide6 sounddevice numpy opencc-python-reimplemented pypinyin
 if errorlevel 1 (
   echo.
   echo 依赖安装失败。多半是网络，换清华源重试：
-  echo   "%VK_VENV%\Scripts\python.exe" -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple sherpa-onnx PySide6 sounddevice numpy opencc-python-reimplemented
+  echo   "%VK_VENV%\Scripts\python.exe" -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple sherpa-onnx PySide6 sounddevice numpy opencc-python-reimplemented pypinyin
   pause
   exit /b 1
 )

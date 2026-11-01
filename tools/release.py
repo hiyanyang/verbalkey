@@ -75,7 +75,7 @@ x 解压到 C:\\Program Files 或 C:\\Windows 下面
   解压到桌面、文档、D 盘都行，路径里别带空格和特殊符号最稳。
 
 x 只把 Verbalkey.exe 单独拷到别的地方
-  它自己只有 4.7 MB，真正的东西在旁边的 _internal 文件夹里，单拷必报错。
+  exe 自己只有几 MB，真正的东西在旁边的 _internal 文件夹里，单拷必报错。
   要挪位置、要拷到 U 盘，整个 Verbalkey 文件夹一起挪。
 
 不需要安装 Python，也不需要命令行。
@@ -198,7 +198,10 @@ def main() -> int:
         names = z.namelist()
     for needle in ("Verbalkey/Verbalkey.exe", "Verbalkey/使用说明.txt",
                    "Verbalkey/_internal/PySide6/pyside6.abi3.dll",
-                   "Verbalkey/_internal/sherpa_onnx"):
+                   "Verbalkey/_internal/sherpa_onnx",
+                   # 拼音字典漏进去是「静默失效」：程序照样跑，只是中文热词
+                   # 一条都改不了，日志里才有一行提示。所以必须在发布前挡住。
+                   "Verbalkey/_internal/pypinyin/pinyin_dict.json"):
         if not any(x.startswith(needle) for x in names):
             bad.append(f"缺 {needle}")
     for forbidden in ("Verbalkey/models/", "Verbalkey/logs/", "Verbalkey/data/",
