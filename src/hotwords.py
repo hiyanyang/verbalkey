@@ -401,6 +401,22 @@ def _is_cn(s: str) -> bool:
     return bool(s) and all("\u4e00" <= ch <= "\u9fff" for ch in s)
 
 
+def _ok_token(s: str) -> bool:
+    """这条差异值不值得学。
+
+    原来只认纯汉字，**英文词一条都进不来** —— 实测语料里五条含 GitHub 的
+    记录，草稿侧分别写成「给他们」「略微」「skill」，全都因为
+    `_is_cn('GitHub') == False` 被丢弃，用户手动改了三次也没学会。
+    现在放开到「纯汉字 或 纯 ASCII 字母数字」，中英混排（如「review人」）
+    仍然拒绝，那种替换面太大。
+    """
+    if not s:
+        return False
+    if _is_cn(s):
+        return True
+    return all(ch.isascii() and (ch.isalnum()) for ch in s)
+
+
 def _diff_spans(a: str, b: str) -> list[tuple[str, str]]:
     """对齐草稿和终稿，取出「听错 → 听对」的连续片段。
 
@@ -432,7 +448,7 @@ def _diff_spans(a: str, b: str) -> list[tuple[str, str]]:
         wrong, right = a[i1:i2], b[j1:j2]
         if not (MIN_LEN <= len(wrong) <= MAX_LEN and MIN_LEN <= len(right) <= MAX_LEN):
             continue
-        if not (_is_cn(wrong) and _is_cn(right)):
+        if not (_ok_token(wrong) and _ok_token(right)):
             continue
         out.append((wrong, right))
     return out
@@ -513,6 +529,229 @@ def apply_corrections(text: str) -> str:
                 hits.append(f"{wrong}→{right}")
     if hits:
         log.info("应用学到的纠正 %d 处：%s", len(hits), "、".join(hits))
+    return text
+
+
+# ------------------------------------------------ 按热词做同音 / 近形修正
+#
+# 为什么在解码热词之外还要再来一层：
+#
+#   1. 解码热词是拼进 prompt 的，和音频抢同一个 max_total_len(1024)，
+#      所以只能给 8 个（见 MAX_MANUAL 上方的实测）；
+#   2. 词给多了解码会整体退化，实测 19 个词直接把整句解成 0 字；
+#   3. **给了热词也会偶尔听错**：用户实测「github」手动改过两三次，
+#      之后仍然复发。热词只是提高概率，不是保证。
+#
+# 所以在输出之后再加一道纯文本修正：不进解码、不占 token、不限数量。
+# 业界也是这么分的 —— FunASR 文档把 hotword（上下文偏置，原文「不保证
+# 一定插入指定词，也不是确定性文本替换」）和 postprocess_hotwords
+# （显式映射替换）做成两个不同参数，并且注明模糊匹配要用 pypinyin。
+#
+# 两条路，原则都是**宁可漏修，不误改**：
+#
+#   中文：无声调拼音逐个相等才换。热词「压疮」是 ya1 chuang1，错听成的
+#         「压床」是 ya1 chuang2 —— 声调不同，但无声调一样。模型听错时
+#         往往连声调一起错，卡住声调就什么都修不了，所以这里不卡。
+#
+#   英文：去掉空格后**字符数必须完全相同**，且相似度 ≥ 0.82。
+#         为什么非要卡等长 —— 实测 skills→skill 相似度 0.909、
+#         markdownn→markdown 0.941，这两个都是合法写法，改了就是错。
+#         代价是 githb→github（差一个字母）修不了。漏修能接受，误改不行。
+#
+# 中文不足 2 字的不参与（单字替换面太大，会毁整句）。
+
+_PY_OK = False
+try:                                    # pypinyin 是可选依赖：
+    from pypinyin import lazy_pinyin, Style   # 打包漏了它也不能让程序起不来
+    _PY_OK = True
+except Exception:                       # pragma: no cover
+    lazy_pinyin = None                  # type: ignore
+    Style = None                        # type: ignore
+
+_EN_TOL = 0.82      # 英文近形相似度下限
+_CN_RUN = re.compile(r"[\u4e00-\u9fff]+")
+_EN_RUN = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._\-]*[A-Za-z0-9]|[A-Za-z0-9]")
+
+
+def _py_chars(s: str, tone: bool = False) -> list[str]:
+    """逐字拼音，长度与 s 一致。拿不到拼音就返回空。"""
+    if not _PY_OK:
+        return []
+    try:
+        got = lazy_pinyin(s, style=Style.TONE3 if tone else Style.NORMAL,
+                          errors=lambda x: list(x))
+    except Exception:
+        return []
+    return got if len(got) == len(s) else []
+
+
+def _is_ascii_word(s: str) -> bool:
+    return bool(s) and s.isascii() and any(c.isalpha() for c in s)
+
+
+def _en_close(a: str, b: str) -> bool:
+    """a 是不是 b 的近形错拼（等长、去空格、相似度够）。
+
+    特例：去掉空格后完全相等，说明拼写本身没错、只是被听成了分开的两三个
+    词（实测「mark down」→ markdown）。这种情况要合并，但**只有原文里真有
+    空格时才算** —— 否则「GitHub」和热词「github」只差大小写，也会被改成
+    用户填的写法，等于无端改动用户文本。
+    """
+    x, y = a.replace(" ", "").lower(), b.replace(" ", "").lower()
+    if not x or not y:
+        return False
+    if x == y:
+        return a != b and " " in a
+    if len(x) != len(y):
+        return False
+    if x[0] != y[0]:
+        return False
+    return difflib.SequenceMatcher(None, x, y, autojunk=False).ratio() >= _EN_TOL
+
+
+def _cn_spans(text: str, word: str) -> tuple[list[tuple[int, int]], list[str]]:
+    """找和 word 同音的片段。
+
+    返回 (自动改的区间, 只提示不改的说明)。
+
+    分级的原因是一次实测：热词「护理」hu4 li3 会把「互利共赢」hu4 li4
+    改成「护理共赢」—— 两个都是真词，只是声调不同。文本上看不出哪个是
+    用户想说的，硬改就是毁句子。所以：
+
+      * 声调也完全一致  → 自动改（同音同调的真词碰撞极少）
+      * 只无声调一致    → 只记日志，不动文本。用户能看到「功能在工作」，
+                          也能自己判断要不要把这个词当成错听处理。
+
+    代价要说清：「压床」ya1 chuang2 vs「压疮」ya1 chuang1 只差声调，
+    这种最常见的同音选字错**不会被自动修正**，只会出现在日志里。
+    """
+    py_w = _py_chars(word, tone=True)
+    py_flat_w = _py_chars(word, tone=False)
+    n = len(word)
+    if not py_w or n < 2:
+        return [], []
+    spans: list[tuple[int, int]] = []
+    hints: list[str] = []
+    for m in _CN_RUN.finditer(text):
+        run, base = m.group(0), m.start()
+        if len(run) < n:
+            continue
+        pys = _py_chars(run, tone=True)
+        flat = _py_chars(run, tone=False)
+        if not pys:
+            continue
+        i = 0
+        while i + n <= len(run):
+            seg = run[i:i + n]
+            if seg == word:             # 已经是对的
+                i += 1
+                continue
+            if pys[i:i + n] == py_w:
+                spans.append((base + i, base + i + n))
+                i += n                  # 命中就整段跳过，避免重叠替换
+                continue
+            if flat and py_flat_w and flat[i:i + n] == py_flat_w:
+                note = f"{seg}≈{word}"
+                if note not in hints:
+                    hints.append(note)
+            i += 1
+    return spans, hints
+
+
+def _en_spans(text: str, word: str) -> list[tuple[int, int]]:
+    """在文本里找 word 的近形错拼，返回区间列表（不重叠）。
+
+    要处理「get hub」这种被听成两个词的情况，所以按空格切 token 后再
+    把相邻 token 拼起来比 —— 拼之前先去掉空格，正好对上 _en_close。
+    """
+    out: list[tuple[int, int]] = []
+    wlen = len(word)
+    for m in _EN_RUN.finditer(text):
+        seg = m.group(0)
+        base = m.start()
+        # token 起止位置，比按空格切更准（连续空格、首尾空格都不怕）
+        toks = [(base + t.start(), base + t.end()) for t in re.finditer(r"\S+", seg)]
+        taken = 0
+        for i in range(len(toks)):
+            for j in range(i, min(len(toks), i + 4)):
+                cand = text[toks[i][0]:toks[j][1]]
+                if len(cand.replace(" ", "")) > wlen + 1:
+                    break
+                if _en_close(cand, word):
+                    if toks[i][0] >= taken:     # 不与已命中的重叠
+                        out.append((toks[i][0], toks[j][1]))
+                        taken = toks[j][1]
+                    break
+    return out
+
+
+def phonic_fix(text: str, words: list[str]) -> tuple[str, list[str]]:
+    """按热词做同音 / 近形修正。返回 (新文本, 命中说明)。
+
+    words 是**全部**手动词，不受 MAX_MANUAL 限制 —— 这是这个函数存在的
+    意义：超过 8 个的词进不了解码 prompt，但仍然能在这里生效。
+    """
+    if not text or not words:
+        return text, []
+    hits: list[str] = []
+    hints: list[str] = []
+    # 长词优先：短词先换会把长词的落点破坏掉
+    for w in sorted({w.strip() for w in words if w}, key=len, reverse=True):
+        if len(w) < 2:
+            continue
+        if _is_ascii_word(w):
+            spans = _en_spans(text, w)
+        elif _is_cn(w):
+            spans, h = _cn_spans(text, w)
+            for x in h:
+                if x not in hints:
+                    hints.append(x)
+        else:
+            continue                    # 中英混排的热词不参与，替换面说不清
+        for a, b in reversed(spans):
+            old = text[a:b]
+            if old == w:
+                continue
+            text = text[:a] + w + text[b:]
+            hits.append(f"{old}→{w}")
+    if hits:
+        log.info("热词同音修正 %d 处：%s", len(hits), "、".join(hits))
+    if hints:
+        log.info("热词同音但声调不同，未改（要改请手动）：%s", "、".join(hints))
+    return text, hits
+
+
+def phonic_ready() -> bool:
+    """同音修正能不能用：既要 pypinyin 能 import，也要字典真的算得出拼音。
+
+    只查 import 不够 —— 打包漏了 pinyin_dict.json 时 import 照样成功，
+    但每次算拼音都会抛异常、被 _py_chars 吞成空列表，中文热词一条都改不了，
+    表面上却一切正常。所以这里实算一次。
+    """
+    return _PY_OK and bool(_py_chars("压疮"))
+
+
+def manual_list(manual: str) -> list[str]:
+    """解析设置页填的热词串，返回去重后的完整词表（不截断）。"""
+    out: list[str] = []
+    seen: set[str] = set()
+    for w in _SPLIT.split(manual or ""):
+        w = w.strip()
+        if w and w not in seen:
+            seen.add(w)
+            out.append(w)
+    return out
+
+
+def post_fix(text: str, manual: str = "") -> str:
+    """输出后的统一修正入口：先学到的精确替换，再按热词同音修正。"""
+    text = apply_corrections(text)
+    words = manual_list(manual)
+    if words:
+        try:
+            text, _ = phonic_fix(text, words)
+        except Exception as e:
+            log.warning("热词同音修正失败（忽略）：%s", e)
     return text
 
 

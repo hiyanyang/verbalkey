@@ -9,8 +9,9 @@ from PyInstaller.utils.hooks import collect_all
 
 datas, binaries, hiddenimports = [], [], []
 
-# 这三个都带数据文件或原生库，自动分析经常漏
-for pkg in ("opencc", "sounddevice", "sherpa_onnx"):
+# 这几个都带数据文件或原生库，自动分析经常漏。
+# pypinyin 带的是拼音字典（JSON），漏了它热词同音修正会静默降级成只认英文。
+for pkg in ("opencc", "sounddevice", "sherpa_onnx", "pypinyin"):
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b

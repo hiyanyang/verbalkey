@@ -516,24 +516,34 @@ class SettingsWindow(QMainWindow):
         c2.add_widget(self.txt_rep, Qt.AlignLeft, 1)
         self._put(lay, c2)
 
-        c3 = Card("热词", "默认不带热词。只有你填了，才会在识别时优先匹配这些词"
-                          "（最多 8 个，逗号分隔）。填了要按下面按钮重载识别模型。")
+        c3 = Card("热词", "只对语音输入生效，跟拼音输入法无关。前 8 个进解码；"
+                          "超出的不进解码，但识别后会按同音／近形自动改回来"
+                          "（不占名额）。填了要按下面按钮重载识别模型。")
         self.ed_hw = QLineEdit(str(CONFIG.get("asr", "hotwords") or ""))
         self.ed_hw.setPlaceholderText("可选：最常被听错的那两三个词")
-        self.ed_hw.textChanged.connect(lambda t: self._save("asr", "hotwords", t))
-        c3.add_widget(self.ed_hw, Qt.AlignLeft, 1)
+        self.ed_hw.setMinimumWidth(360)
+        c3.add_widget(self.ed_hw, Qt.Alignment(), 1)
+
+        # 实时容量提示。以前超过 8 个是**静默丢弃**的：填 12 个看起来
+        # 全部生效，实际只有前 8 个进解码，界面上一个字都不提。
+        self.lbl_hw_cnt = QLabel("")
+        self.lbl_hw_cnt.setWordWrap(True)
+        c3.add_widget(self.lbl_hw_cnt, Qt.Alignment(), 1)
+        self.ed_hw.textChanged.connect(self._on_hw_changed)
+        self._on_hw_changed(self.ed_hw.text())
 
         try:
             from .. import hotwords as _hw
             st = _hw.stats()
-            note = f"当前生效 {len(st['words'])} 个"
+            bits = []
             if st.get("learned"):
-                note += f"，已从改正里学到 {st['learned']} 条"
+                bits.append(f"已从改正里学到 {st['learned']} 条")
             if st["chars"]:
-                note += f"，已积累 {st['chars']} 字语料（仅本机）"
-            lbl = QLabel(note)
-            lbl.setStyleSheet(f"color:{MUTED};font-size:13px;")
-            c3.add_widget(lbl)
+                bits.append(f"已积累 {st['chars']} 字语料（仅本机）")
+            if bits:
+                lbl = QLabel("，".join(bits))
+                lbl.setStyleSheet(f"color:{MUTED};font-size:13px;")
+                c3.add_widget(lbl, Qt.Alignment(), 1)
         except Exception:
             pass
 
@@ -542,6 +552,27 @@ class SettingsWindow(QMainWindow):
         btn.clicked.connect(lambda: self.app.reload_asr() if self.app else None)
         c3.add_widget(btn)
         self._put(lay, c3)
+
+    def _on_hw_changed(self, text: str) -> None:
+        """热词框改动：写配置 + 刷新「几个进解码」的容量提示。"""
+        self._save("asr", "hotwords", text)
+        try:
+            from .. import hotwords as _hw
+            words = _hw.manual_list(text)
+            n, cap = len(words), _hw.MAX_MANUAL
+            if n == 0:
+                msg, over = "还没填热词。", False
+            elif n <= cap:
+                msg, over = f"已填 {n} 个，全部进解码。", False
+            else:
+                over = True
+                msg = (f"已填 {n} 个：前 {cap} 个进解码，"
+                       f"其余 {n - cap} 个只在识别后按同音／近形修正。")
+            self.lbl_hw_cnt.setText(msg)
+            self.lbl_hw_cnt.setStyleSheet(
+                f"color:{PINK if over else MUTED};font-size:13px;")
+        except Exception:
+            pass
 
     def _save_replacements(self):
         out = {}

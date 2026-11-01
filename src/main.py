@@ -667,6 +667,14 @@ class App:
                 manual = str(CONFIG.get("asr", "hotwords") or "")
                 hw = hotwords.for_asr(manual)
                 log.info(f"热词 {len(hw.split(',')) if hw else 0} 个：{hw[:80]}")
+                # 热词框里一共几个 / 同音修正能不能用，都要在启动时留一行，
+                # 否则「填了 11 个却只有 8 个进解码」「中文一条都没改」这类
+                # 情况在日志里完全看不出来。
+                log.info("热词共填 %d 个（进解码上限 %d），同音修正%s",
+                         len(hotwords.manual_list(manual)),
+                         hotwords.MAX_MANUAL,
+                         "可用" if hotwords.phonic_ready()
+                         else "不可用：pypinyin 没加载到，中文热词不生效")
                 secs = self.asr.load(
                     d,
                     int(CONFIG.get("asr", "num_threads")),
@@ -1122,12 +1130,14 @@ class App:
             log.info("整段重解没有结果（%.2fs），沿用分段结果", dt)
             return draft
         text = process(text, CONFIG.get("text"))
-        # 把「从改正里学」到的对照表应用上去。只做文本替换，不进解码 prompt ——
-        # 这样不会幻觉、不占音频预算，只在原字串原样出现时才动手。
+        # 输出后修正两步：先学到的精确替换，再按热词做同音 / 近形修正。
+        # 两步都不进解码 prompt —— 不占音频预算、不引幻觉，也不受
+        # MAX_MANUAL(8) 的名额限制：超过 8 个的热词在这里仍然生效。
         try:
-            text = hotwords.apply_corrections(text)
+            text = hotwords.post_fix(
+                text, str(CONFIG.get("asr", "hotwords") or ""))
         except Exception as e:
-            log.warning("应用纠正表失败（忽略）：%s", e)
+            log.warning("应用修正失败（忽略）：%s", e)
         log.info("整段重解 %.1fs 有声（总长 %.1fs，%s），耗时 %.2fs："
                  "分段 %d 字 → 整段 %d 字",
                  secs, total, ("分 %d 块" % len(chunks)) if chunks else "整段一次",
@@ -1585,7 +1595,7 @@ def main():
     app = App(qt)
     # 启动标记：每次部署完先看这一行，确认跑的是哪一版、哪个行为开关生效。
     # 没有这行就只能靠猜（曾经把「应该已经生效」当成结论报给用户）。
-    log.info("启动标记 BUILD=2026-11-01-r18 版本=%s 整段重解上限=%.0fs "
+    log.info("启动标记 BUILD=2026-11-01-r19 版本=%s 整段重解上限=%.0fs "
              "分块上限=%.0fs×%d 粘贴模式=%s 整理级别=%s 自动替换=%s",
              APP_VERSION,
              _MAX_REDECODE_SEC, _CHUNK_SEC, _MAX_CHUNKS,
